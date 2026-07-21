@@ -209,7 +209,7 @@ For CI, use `local` as the host when running directly on the baremetal machine:
 | `verify ID [--server S]` | Deploys a test pod that checks cluster DNS, external DNS resolution, and API access via service account. Reports PASS/FAIL per check. |
 | `destroy ID\|--all [--server S]` | Tear down a clone. |
 | `push NAME --registry REPO --tag TAG [--server S]` | Push a flavor to an OCI registry. Splits, compresses, builds multi-layer image. |
-| `pull IMAGE [--name NAME] [--server S]` | Pull a flavor from an OCI registry. Downloads, decompresses, reassembles, registers. |
+| `pull IMAGE [--server S]` | Pull a flavor from an OCI registry. Downloads, decompresses, reassembles, registers. |
 
 ## OCI Distribution
 

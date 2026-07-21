@@ -1844,8 +1844,8 @@ class TestPull(unittest.TestCase):
         m["disks"][0]["chunk_count"] = 1
         return m
 
-    def _pull_args(self, image="quay.io/org/repo:tag", name=None):
-        return argparse.Namespace(image=image, name=name)
+    def _pull_args(self, image="quay.io/org/repo:tag"):
+        return argparse.Namespace(image=image)
 
     def _inner_mock_run(self, cmd, *, check=True):
         self.calls.append(cmd)
@@ -1879,32 +1879,32 @@ class TestPull(unittest.TestCase):
              patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
             ct.cmd_pull(self._pull_args())
         state = self.mock_env.get_saved_state()
-        self.assertIn("test-pulled", state["flavors"])
-        flavor = state["flavors"]["test-pulled"]
+        self.assertIn("tag", state["flavors"])
+        flavor = state["flavors"]["tag"]
         self.assertEqual(flavor["vcpus"], 16)
         self.assertEqual(flavor["memory_kib"], 67108864)
         self.assertEqual(flavor["source_cluster"], "abc")
         self.assertEqual(flavor["disks"], ["disk-0.qcow2"])
 
-    def test_pull_name_override(self):
+    def test_pull_names_flavor_from_image_tag_not_manifest(self):
         wrapped = self.mock_env.wrap_run(self._inner_mock_run)
         with patch.object(ct.env, "run", side_effect=wrapped), \
              patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
-            ct.cmd_pull(self._pull_args(name="custom"))
+            ct.cmd_pull(self._pull_args(image="quay.io/osac-project/cluster-flavors:caas"))
         state = self.mock_env.get_saved_state()
-        self.assertIn("custom", state["flavors"])
+        self.assertIn("caas", state["flavors"])
         self.assertNotIn("test-pulled", state["flavors"])
 
     def test_pull_existing_flavor_exits(self):
         self.mock_env.save_initial_state({
-            "flavors": {"test-pulled": {"disks": []}},
+            "flavors": {"tag": {"disks": []}},
             "clones": {}})
         wrapped = self.mock_env.wrap_run(self._inner_mock_run)
         with patch.object(ct.env, "run", side_effect=wrapped), \
              patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
             with self.assertRaises(SystemExit) as ctx:
                 ct.cmd_pull(self._pull_args())
-        self.assertIn("test-pulled", str(ctx.exception))
+        self.assertIn("tag", str(ctx.exception))
 
     def test_pull_cleanup_on_failure(self):
         fail_calls = []
@@ -1948,7 +1948,7 @@ class TestPull(unittest.TestCase):
             ct.cmd_pull(self._pull_args())
         crypto_cmds = [c for c in self.calls if "strip-components" in c and self._CRYPTO_DIGEST in c]
         self.assertEqual(len(crypto_cmds), 1)
-        self.assertIn(ct.flavor_crypto_dir("test-pulled"), crypto_cmds[0])
+        self.assertIn(ct.flavor_crypto_dir("tag"), crypto_cmds[0])
 
 
 class TestSetupClient(unittest.TestCase):

@@ -70,7 +70,7 @@ cluster-tool boot --flavor <flavor> --name <name> [--server <server>]
 If no flavors are available locally, pull one from Quay:
 
 ```bash
-cluster-tool pull <image> [--name <name>] [--server <server>]
+cluster-tool pull <image> [--server <server>]
 ```
 
 ### Snapshot a running cluster
@@ -92,7 +92,7 @@ Splits disks into 1GB chunks, compresses with pigz, builds an OCI image, pushes 
 ### Pull a flavor from a registry
 
 ```bash
-cluster-tool pull <image> [--name <name>] [--server <server>]
+cluster-tool pull <image> [--server <server>]
 ```
 
 Downloads, decompresses, reassembles disks, registers the flavor locally.

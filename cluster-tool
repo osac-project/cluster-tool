@@ -1470,7 +1470,7 @@ def cmd_pull(args):
         manifest = parse_manifest(r.stdout)
         print_step(2, total, "Reading manifest", "done")
 
-        flavor_name = args.name or manifest["flavor"]
+        flavor_name = image_ref.rsplit("/", 1)[-1].rsplit(":", 1)[-1]
         state = load_state()
         if flavor_name in state["flavors"]:
             sys.exit(f"Flavor '{flavor_name}' already exists. Delete it first with 'cluster-tool flavors --delete {flavor_name}'.")
@@ -1781,7 +1781,6 @@ def main():
 
     pull_p = sub.add_parser("pull", help="Pull a flavor from an OCI registry")
     pull_p.add_argument("image", help="Full image reference (e.g., quay.io/org/repo:tag)")
-    pull_p.add_argument("--name", help="Local flavor name (default: from manifest)")
 
     setup_p = sub.add_parser("setup", help="One-time client setup")
     setup_p.add_argument("mode", choices=["client"], help="'client' for DNS setup")
