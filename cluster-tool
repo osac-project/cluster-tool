@@ -789,6 +789,17 @@ def cmd_snapshot(args):
     if not nodeip_image:
         sys.exit("Failed to detect nodeip-configuration image from systemd unit")
     cache_image(vm_ip, nodeip_image, "cache-nodeip")
+    # The standalone etcd container recert starts (cmd_boot, "Running
+    # recert") pulls this image with --authfile /var/lib/kubelet/config.json
+    # -- the golden snapshot's frozen copy of that file, which cmd_boot must
+    # not overwrite out-of-band (MCO owns it; see
+    # test_boot_pull_secret_not_written_to_node). Caching it here, like
+    # RECERT_IMAGE and nodeip_image above, means that authfile is never
+    # actually needed at boot time: the image is already present locally, so
+    # podman's default --pull=missing behavior skips the network pull (and
+    # the credential check) entirely, regardless of whether the pull secret
+    # baked into the snapshot is still valid by the time this snapshot boots.
+    cache_image(vm_ip, etcd_image, "cache-etcd")
     print_step(6, 11, "Caching boot images", "done")
 
     print_step(7, 11, "Pruning unused container images")
@@ -796,7 +807,7 @@ def cmd_snapshot(args):
         "sudo crictl ps -a --state exited -q 2>/dev/null | xargs -r sudo crictl rm && "
         "sudo crictl --timeout 120s rmi --prune && "
         "sudo podman image prune -a -f && "
-        "sudo podman rm cache-recert cache-nodeip")
+        "sudo podman rm cache-recert cache-nodeip cache-etcd")
     print_step(7, 11, "Pruning unused container images", "done")
 
     print_step(8, 11, "Shutting down VM")

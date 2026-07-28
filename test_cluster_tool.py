@@ -1433,6 +1433,8 @@ class TestSnapshot(unittest.TestCase):
         self.assertIn("crictl --timeout 120s rmi --prune", cmd)
         self.assertIn("podman image prune -a -f", cmd)
         self.assertIn("podman rm cache-recert", cmd)
+        self.assertIn("cache-nodeip", cmd)
+        self.assertIn("cache-etcd", cmd, "etcd anchor must be cleaned up too, not left leaking")
 
     @patch("time.sleep")
     def test_snapshot_caches_recert_before_prune(self, _):
@@ -1476,8 +1478,34 @@ class TestSnapshot(unittest.TestCase):
         pull_cmds = [c for c in self.calls if "podman pull" in c]
         self.assertEqual(pull_cmds, [], "must not pull an image already present locally")
         anchor_cmds = [c for c in self.calls if "podman create --replace --name cache-recert" in c
-                       or "podman create --replace --name cache-nodeip" in c]
-        self.assertEqual(len(anchor_cmds), 2, "must still anchor both already-cached images")
+                       or "podman create --replace --name cache-nodeip" in c
+                       or "podman create --replace --name cache-etcd" in c]
+        self.assertEqual(len(anchor_cmds), 3, "must still anchor all three already-cached images")
+
+    @patch("time.sleep")
+    def test_snapshot_caches_etcd_image(self, _):
+        ssh = self._make_ssh_mock()
+        wrapped = self.mock_env.wrap_run_positional(ssh)
+        with patch.object(ct.env, "run", side_effect=wrapped), \
+             patch.object(ct.env, "run_vm", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_snapshot(self._snapshot_args())
+
+        # _make_ssh_mock resolves the detected etcd image to this fixed value.
+        pull_cmds = [c for c in self.calls if "podman pull" in c and "quay.io/test/etcd:latest" in c]
+        self.assertEqual(len(pull_cmds), 1,
+            "must pull the etcd image so cmd_boot's recert step never needs "
+            "the snapshot's (possibly stale) baked-in pull secret")
+        anchor_cmds = [c for c in self.calls if "podman create --replace --name cache-etcd" in c]
+        self.assertEqual(len(anchor_cmds), 1, "must anchor the etcd image so prune doesn't remove it")
+
+        pull_idx = next(i for i, c in enumerate(self.calls)
+                         if "podman pull" in c and "quay.io/test/etcd:latest" in c)
+        anchor_idx = next(i for i, c in enumerate(self.calls)
+                           if "podman create --replace --name cache-etcd" in c)
+        prune_idx = next(i for i, c in enumerate(self.calls) if "podman image prune" in c)
+        self.assertLess(pull_idx, anchor_idx, "pull must happen before anchor creation")
+        self.assertLess(anchor_idx, prune_idx, "anchor must exist before prune runs")
 
     @patch("time.sleep")
     def test_snapshot_anchor_creation_survives_leftover_container(self, _):
