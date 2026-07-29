@@ -355,6 +355,68 @@ Each clone gets a fully unique identity through recert:
 
 For deep technical details on how snapshot recloning works (OVN cleanup, etcd certificate hardlinks, standalone etcd, forked recert image), see [INTERNALS.md](INTERNALS.md).
 
+## Snapshot Creation Scripts
+
+The `scripts/` directory contains Python scripts that automate the full pipeline for creating OSAC snapshot flavors: boot a base SNO, install OSAC components via Helm, validate health, strip credentials, snapshot, and push to OCI registry.
+
+### Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/snapshot_lib.py` | Shared library: health checks, scale-down, credential stripping, `create_snapshot()` |
+| `scripts/snapshot_base.py` | Create a base SNO snapshot (kubeletconfig only, no OSAC install) |
+| `scripts/snapshot_caas.py` | Create a CaaS flavor (SNO + LVMS + MCE + MetalLB + OSAC) |
+| `scripts/snapshot_vmaas.py` | Create a VMaaS flavor (SNO + LVMS + CNV + MetalLB + OSAC) |
+| `scripts/kubeletconfig.yaml` | KubeletConfig manifest setting maxPods=500 |
+
+### Prerequisites
+
+- A connected baremetal server (`cluster-tool connect`)
+- A base SNO flavor already pulled or created (default: `sno-4-22`)
+- An `osac-installer` checkout (for Helm values and `make install`)
+- A pull-secret JSON file (default: `~/.pull-secret.json`)
+- `cluster-tool`, `oc`, and `make` on `$PATH`
+
+### Usage
+
+```bash
+# Create a base SNO snapshot from a running cluster
+SOURCE=6ef80144 KUBECONFIG=~/.kube/my-cluster.kubeconfig python scripts/snapshot_base.py
+
+# Create a CaaS snapshot (boots from base, installs OSAC, snapshots)
+python scripts/snapshot_caas.py
+
+# Create a VMaaS snapshot
+python scripts/snapshot_vmaas.py
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INSTALLER_DIR` | `../osac-installer` | Path to the osac-installer checkout |
+| `KUBELETCONFIG` | `scripts/kubeletconfig.yaml` | Path to the KubeletConfig manifest |
+| `PULL_SECRET` | `~/.pull-secret.json` | Path to the registry pull-secret JSON |
+| `SERVER` | `rdu07` | Baremetal server alias |
+| `BASE_FLAVOR` | `sno-4-22` | Base flavor to boot from (CaaS/VMaaS scripts) |
+| `SOURCE` | *(required for base)* | Clone ID of the running SNO instance |
+| `KUBECONFIG` | *(required for base)* | Path to kubeconfig |
+
+### Pipeline
+
+The CaaS and VMaaS scripts run a 10-step pipeline:
+
+1. Boot from base flavor
+2. Apply cluster prerequisites (OVN masquerade subnet, kubeletconfig)
+3. Run pre-setup hook (if any)
+4. Deploy OSAC via `make install` with the flavor's values file
+5. Validate health (cluster operators, rollout status, AAP, no crashing pods)
+6. Scale all workloads to zero
+7. Strip credentials (pull-secret, AAP license, quay-pull-secret)
+8. Wait for MCO to propagate empty pull-secret
+9. Snapshot the VM
+10. Push to OCI registry
+
 ## Testing
 
 ```bash
