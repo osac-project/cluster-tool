@@ -1,0 +1,179 @@
+# OSAC-3353 + OSAC-3357: Build, validate, and publish a base SNO snapshot.
+#
+# Prerequisites:
+#   - A running SNO cluster on the baremetal runner (source clone ID required).
+#   - The scripts/ directory with snapshot_base.py (added by OSAC-3352).
+#
+# The pipeline creates a snapshot from the source cluster, boots a fresh clone
+# from that snapshot to validate it, then pushes the validated snapshot to Quay.
+
+name: Build and Validate Base SNO Snapshot
+
+on:
+  workflow_dispatch:
+    inputs:
+      ocp_version:
+        description: "OCP version slug (e.g. 4-22)"
+        required: true
+        type: string
+      source:
+        description: "Clone ID of running source cluster (8 hex chars from virsh list)"
+        required: true
+        type: string
+  push:
+    branches: [main]
+    paths: ["scripts/**"]
+
+permissions: {}
+
+concurrency:
+  group: build-base-sno-${{ inputs.ocp_version || '4-22' }}
+  cancel-in-progress: false
+
+jobs:
+  build-snapshot:
+    runs-on: [self-hosted, baremetal]
+    if: >-
+      github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set environment variables
+        run: |
+          echo "FLAVOR_NAME=sno-${OCP_VERSION}" >> "$GITHUB_ENV"
+          echo "SERVER=${SERVER_ALIAS}" >> "$GITHUB_ENV"
+        env:
+          OCP_VERSION: ${{ inputs.ocp_version }}
+          SERVER_ALIAS: ${{ vars.SERVER || 'rdu07' }}
+
+      - name: Connect to local server
+        run: |
+          ./cluster-tool connect ci --host local --data-path "${DATA_PATH}"
+        env:
+          DATA_PATH: ${{ vars.DATA_PATH || '/data/cluster-tool' }}
+
+      - name: Write pull secret
+        run: |
+          umask 077
+          echo "$PULL_SECRET" > /tmp/pull-secret.json
+        env:
+          PULL_SECRET: ${{ secrets.PULL_SECRET }}
+
+      - name: Create base snapshot
+        run: |
+          python3 scripts/snapshot_base.py
+        env:
+          SOURCE: ${{ inputs.source }}
+          KUBECONFIG: ${{ format('{0}/.kube/{1}.kubeconfig', env.HOME, inputs.source) }}
+
+  validate-snapshot:
+    needs: build-snapshot
+    runs-on: [self-hosted, baremetal]
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set environment variables
+        run: |
+          echo "FLAVOR_NAME=sno-${OCP_VERSION}" >> "$GITHUB_ENV"
+        env:
+          OCP_VERSION: ${{ inputs.ocp_version }}
+
+      - name: Boot cluster from snapshot
+        run: |
+          ./cluster-tool boot \
+            --flavor "$FLAVOR_NAME" \
+            --name validate \
+            --pull-secret /tmp/pull-secret.json
+
+      - name: Validate nodes are Ready
+        run: |
+          export KUBECONFIG="$HOME/.kube/validate.kubeconfig"
+          echo "Checking node status..."
+          oc get nodes
+          NODE_STATUS=$(oc get nodes -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}')
+          if [ "$NODE_STATUS" != "True" ]; then
+            echo "ERROR: Node is not Ready (status: $NODE_STATUS)"
+            exit 1
+          fi
+          echo "Node is Ready"
+
+      - name: Validate ClusterOperators
+        run: |
+          export KUBECONFIG="$HOME/.kube/validate.kubeconfig"
+          echo "Checking ClusterOperator status..."
+          oc get co
+
+          DEGRADED=$(oc get co -o json | \
+            python3 -c "
+          import json, sys
+          cos = json.load(sys.stdin)['items']
+          degraded = [co['metadata']['name'] for co in cos
+                      for c in co.get('status', {}).get('conditions', [])
+                      if c['type'] == 'Degraded' and c['status'] == 'True']
+          print(' '.join(degraded))
+          ")
+          if [ -n "$DEGRADED" ]; then
+            echo "ERROR: Degraded operators: $DEGRADED"
+            exit 1
+          fi
+
+          NOT_AVAILABLE=$(oc get co -o json | \
+            python3 -c "
+          import json, sys
+          cos = json.load(sys.stdin)['items']
+          unavail = [co['metadata']['name'] for co in cos
+                     for c in co.get('status', {}).get('conditions', [])
+                     if c['type'] == 'Available' and c['status'] != 'True']
+          print(' '.join(unavail))
+          ")
+          if [ -n "$NOT_AVAILABLE" ]; then
+            echo "ERROR: Unavailable operators: $NOT_AVAILABLE"
+            exit 1
+          fi
+
+          echo "All ClusterOperators are healthy"
+
+      - name: Verify cluster connectivity
+        run: |
+          ./cluster-tool verify validate
+
+      - name: Destroy validation cluster
+        if: always()
+        run: |
+          ./cluster-tool destroy validate || true
+
+  publish-snapshot:
+    needs: validate-snapshot
+    runs-on: [self-hosted, baremetal]
+    if: success()
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Push snapshot to registry
+        run: |
+          ./cluster-tool push "$FLAVOR_NAME" \
+            --registry "$REGISTRY" \
+            --tag "$FLAVOR_NAME"
+        env:
+          FLAVOR_NAME: sno-${{ inputs.ocp_version }}
+          REGISTRY: ${{ vars.QUAY_REGISTRY || 'quay.io/osac-project/cluster-flavors' }}
+
+      - name: Clean up pull secret
+        if: always()
+        run: |
+          rm -f /tmp/pull-secret.json
