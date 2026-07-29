@@ -1,0 +1,257 @@
+---
+# Reusable workflow: boot a cluster from a snapshot flavor, run the E2E test
+# suite for that flavor, and report pass/fail.  Called by the per-flavor
+# validate-{vmaas,caas,bmaas}.yaml thin wrappers.
+#
+# This is a gate check -- a bad snapshot breaks all CI for everyone.  The
+# build workflow should only publish the snapshot after this workflow passes.
+name: Validate Snapshot
+
+on:
+  workflow_call:
+    inputs:
+      snapshot_tag:
+        description: "Snapshot flavor tag to validate (e.g. vmaas-4-22)"
+        required: true
+        type: string
+      test_suite:
+        description: "E2E test suite to run (vmaas, caas, bmaas)"
+        required: true
+        type: string
+      cluster_name:
+        description: "Base name for the validation cluster"
+        required: true
+        type: string
+      flavor_image:
+        description: >-
+          Full OCI image for the flavor.  Defaults to
+          quay.io/osac-project/cluster-flavors:<snapshot_tag>.
+        required: false
+        type: string
+        default: ""
+      namespace:
+        description: "OSAC namespace on the cluster"
+        required: false
+        type: string
+        default: "osac-e2e-ci"
+      test_infra_ref:
+        description: "Git ref for osac-test-infra checkout"
+        required: false
+        type: string
+        default: "main"
+      installer_ref:
+        description: "Git ref for osac-installer checkout"
+        required: false
+        type: string
+        default: "main"
+    secrets:
+      PULL_SECRET:
+        description: "OpenShift pull secret (JSON dockerconfigjson)"
+        required: true
+    outputs:
+      validation_passed:
+        description: "Whether the E2E validation passed (true/false)"
+        value: ${{ jobs.validate.outputs.validation_passed }}
+
+jobs:
+  validate:
+    runs-on: [self-hosted, baremetal]
+    permissions:
+      contents: read
+    outputs:
+      validation_passed: ${{ steps.test.outcome == 'success' }}
+
+    env:
+      # Append run ID so concurrent validations never collide.
+      CLONE_NAME: "${{ inputs.cluster_name }}-${{ github.run_id }}"
+      FLAVOR_NAME: ${{ inputs.snapshot_tag }}
+      E2E_IMAGE: "osac-e2e-validate-${{ inputs.test_suite }}:${{ github.run_id }}"
+
+    steps:
+      # ------------------------------------------------------------------
+      # Setup
+      # ------------------------------------------------------------------
+      - name: Checkout cluster-tool
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Resolve flavor image
+        id: flavor
+        env:
+          SNAPSHOT_TAG: ${{ inputs.snapshot_tag }}
+          FLAVOR_IMAGE_INPUT: ${{ inputs.flavor_image }}
+        run: |
+          IMAGE="${FLAVOR_IMAGE_INPUT}"
+          if [[ -z "${IMAGE}" ]]; then
+            IMAGE="quay.io/osac-project/cluster-flavors:${SNAPSHOT_TAG}"
+          fi
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+
+      - name: Write pull secret
+        env:
+          PULL_SECRET: ${{ secrets.PULL_SECRET }}
+        run: |
+          printf '%s' "${PULL_SECRET}" > "${RUNNER_TEMP}/pull-secret.json"
+          chmod 600 "${RUNNER_TEMP}/pull-secret.json"
+
+          # Container registry auth for pulling private flavor images.
+          mkdir -p "${HOME}/.config/containers"
+          printf '%s' "${PULL_SECRET}" > "${HOME}/.config/containers/auth.json"
+          chmod 600 "${HOME}/.config/containers/auth.json"
+          sudo mkdir -p /root/.config/containers
+          sudo cp "${HOME}/.config/containers/auth.json" \
+            /root/.config/containers/auth.json
+          sudo chmod 600 /root/.config/containers/auth.json
+
+      # ------------------------------------------------------------------
+      # Cluster lifecycle
+      # ------------------------------------------------------------------
+      - name: Clean up stale resources
+        run: |
+          sudo python3 ./cluster-tool destroy "${CLONE_NAME}" 2>/dev/null || true
+
+          BRIDGE_PREFIX="br-${CLONE_NAME:0:8}"
+          for br in $(ip -o link show \
+              | grep -oP "${BRIDGE_PREFIX}[^ @]*"); do
+            echo "Removing stale bridge ${br}..."
+            sudo ip link set "${br}" down 2>/dev/null || true
+            sudo ip link delete "${br}" 2>/dev/null || true
+          done
+
+          sudo python3 ./cluster-tool cleanup-haproxy 2>/dev/null || true
+
+      - name: Pull flavor
+        env:
+          FLAVOR_IMAGE: ${{ steps.flavor.outputs.image }}
+        run: |
+          if sudo python3 ./cluster-tool flavors \
+              | grep -q "^${FLAVOR_NAME} "; then
+            echo "Flavor '${FLAVOR_NAME}' already present -- skipping pull."
+          else
+            echo "Pulling flavor '${FLAVOR_NAME}' from ${FLAVOR_IMAGE}..."
+            sudo python3 ./cluster-tool pull "${FLAVOR_IMAGE}"
+          fi
+
+      - name: Boot cluster
+        run: |
+          sudo python3 ./cluster-tool boot \
+            --flavor "${FLAVOR_NAME}" \
+            --name "${CLONE_NAME}" \
+            --pull-secret "${RUNNER_TEMP}/pull-secret.json"
+
+          echo "Cluster clone '${CLONE_NAME}' booted."
+
+          # cluster-tool boot runs as root; copy kubeconfig so the runner
+          # user owns it (podman needs this for :Z relabel mounts).
+          sudo cp "${HOME}/.kube/${CLONE_NAME}.kubeconfig" \
+            "${RUNNER_TEMP}/kubeconfig"
+          sudo chown "$(id -u):$(id -g)" "${RUNNER_TEMP}/kubeconfig"
+          chmod 600 "${RUNNER_TEMP}/kubeconfig"
+
+      # ------------------------------------------------------------------
+      # OSAC refresh -- snapshot-booted clusters have stale routes/certs
+      # ------------------------------------------------------------------
+      - name: Refresh OSAC deployment
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+          INSTALLER_NAMESPACE: ${{ inputs.namespace }}
+          INSTALLER_REF: ${{ inputs.installer_ref }}
+        run: |
+          INSTALLER_DIR="${RUNNER_TEMP}/osac-installer"
+          git clone --recurse-submodules --depth 1 \
+            --branch "${INSTALLER_REF}" \
+            https://github.com/osac-project/osac-installer.git \
+            "${INSTALLER_DIR}"
+          cd "${INSTALLER_DIR}"
+
+          # Ensure helm is available
+          if ! command -v helm &>/dev/null; then
+            curl -fsSL \
+              https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 \
+              | bash
+          fi
+
+          # refresh-after-snapshot.py fixes stale routes/certs, adopts
+          # Helm resources, runs helm upgrade, and waits for health.
+          python3 scripts/refresh-after-snapshot.py
+
+      # ------------------------------------------------------------------
+      # E2E tests
+      # ------------------------------------------------------------------
+      - name: Clone test infrastructure
+        env:
+          TEST_INFRA_REF: ${{ inputs.test_infra_ref }}
+        run: |
+          git clone --depth 1 --branch "${TEST_INFRA_REF}" \
+            https://github.com/osac-project/osac-test-infra.git \
+            "${RUNNER_TEMP}/osac-test-infra"
+
+      - name: Build test image
+        run: |
+          podman build --no-cache \
+            -t "${E2E_IMAGE}" \
+            -f "${RUNNER_TEMP}/osac-test-infra/Containerfile" \
+            "${RUNNER_TEMP}/osac-test-infra"
+
+      - name: Run E2E tests
+        id: test
+        env:
+          OSAC_NAMESPACE: ${{ inputs.namespace }}
+          TEST_SUITE: ${{ inputs.test_suite }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/test-output"
+
+          podman run --rm --network=host \
+            -v "${RUNNER_TEMP}/kubeconfig":/root/.kube/config:ro,Z \
+            -v "${RUNNER_TEMP}/pull-secret.json":/root/pull-secret:ro,Z \
+            -v "${RUNNER_TEMP}/test-output":/tmp/test-output:Z \
+            -e KUBECONFIG=/root/.kube/config \
+            -e OSAC_VM_KUBECONFIG=/root/.kube/config \
+            -e OSAC_NAMESPACE="${OSAC_NAMESPACE}" \
+            -e OSAC_PULL_SECRET_PATH=/root/pull-secret \
+            "${E2E_IMAGE}" \
+            pytest "tests/${TEST_SUITE}/" \
+              --junitxml=/tmp/test-output/junit.xml -v
+
+      # ------------------------------------------------------------------
+      # Artifacts & cleanup
+      # ------------------------------------------------------------------
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: "validation-results-${{ inputs.test_suite }}-${{ github.run_id }}"
+          path: "${{ runner.temp }}/test-output/"
+          retention-days: 14
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Destroy the cluster clone
+          sudo python3 ./cluster-tool destroy "${CLONE_NAME}" 2>/dev/null \
+            || true
+
+          # Remove orphaned bridges
+          BRIDGE_PREFIX="br-${CLONE_NAME:0:8}"
+          for br in $(ip -o link show \
+              | grep -oP "${BRIDGE_PREFIX}[^ @]*"); do
+            sudo ip link set "${br}" down 2>/dev/null || true
+            sudo ip link delete "${br}" 2>/dev/null || true
+          done
+
+          # Remove leftover containers still referencing the test image
+          for c in $(podman ps -a \
+              --filter ancestor="${E2E_IMAGE}" \
+              --format "{{.ID}}" 2>/dev/null); do
+            podman rm -f "${c}" 2>/dev/null || true
+          done
+          podman rmi "${E2E_IMAGE}" 2>/dev/null || true
+
+          # Clean temporary files
+          rm -f "${RUNNER_TEMP}/pull-secret.json" "${RUNNER_TEMP}/kubeconfig"
+          rm -rf "${RUNNER_TEMP}/osac-test-infra" \
+                 "${RUNNER_TEMP}/osac-installer" \
+                 "${RUNNER_TEMP}/test-output"
+          rm -f "${HOME}/.config/containers/auth.json"
+          sudo rm -f /root/.config/containers/auth.json

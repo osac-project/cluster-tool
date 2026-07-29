@@ -1,0 +1,53 @@
+---
+# OSAC-3354: Validate a VMaaS snapshot flavor before publishing.
+#
+# Boots a cluster from the snapshot, runs the VMaaS E2E suite (compute
+# instance lifecycle, VirtualNetwork, Subnet, SecurityGroup), and reports
+# pass/fail.  The build workflow gates publishing on this result.
+name: Validate VMaaS Snapshot
+
+on:
+  workflow_dispatch:
+    inputs:
+      snapshot_tag:
+        description: "Snapshot tag to validate (e.g. vmaas-4-22)"
+        required: true
+        type: string
+      flavor_image:
+        description: "Full OCI image (defaults to quay.io/osac-project/cluster-flavors:<tag>)"
+        required: false
+        type: string
+        default: ""
+  workflow_call:
+    inputs:
+      snapshot_tag:
+        description: "Snapshot tag to validate"
+        required: true
+        type: string
+      flavor_image:
+        description: "Full OCI image for the flavor"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      PULL_SECRET:
+        required: true
+    outputs:
+      validation_passed:
+        description: "Whether the VMaaS validation passed"
+        value: ${{ jobs.validate.outputs.validation_passed }}
+
+concurrency:
+  group: "validate-vmaas-${{ inputs.snapshot_tag }}"
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    uses: ./.github/workflows/validate-snapshot.yaml
+    with:
+      snapshot_tag: ${{ inputs.snapshot_tag }}
+      test_suite: vmaas
+      cluster_name: validate-vmaas
+      flavor_image: ${{ inputs.flavor_image }}
+    secrets:
+      PULL_SECRET: ${{ secrets.PULL_SECRET }}
