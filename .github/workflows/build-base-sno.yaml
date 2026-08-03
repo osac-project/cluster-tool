@@ -32,7 +32,7 @@ concurrency:
 
 jobs:
   build-snapshot:
-    runs-on: [self-hosted, baremetal]
+    runs-on: [self-hosted, clustertool-snapshot]
     if: >-
       github.event_name == 'workflow_dispatch'
     permissions:
@@ -73,7 +73,7 @@ jobs:
 
   validate-snapshot:
     needs: build-snapshot
-    runs-on: [self-hosted, baremetal]
+    runs-on: [self-hosted, clustertool-snapshot]
     permissions:
       contents: read
     steps:
@@ -154,7 +154,7 @@ jobs:
 
   publish-snapshot:
     needs: validate-snapshot
-    runs-on: [self-hosted, baremetal]
+    runs-on: [self-hosted, clustertool-snapshot]
     if: success()
     permissions:
       contents: read
