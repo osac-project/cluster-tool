@@ -81,7 +81,6 @@ jobs:
           python3 scripts/snapshot_base.py
         env:
           SOURCE: ${{ inputs.source }}
-          SKIP_PUSH: "true"
 
       - name: Clean up pull secret
         if: always()
