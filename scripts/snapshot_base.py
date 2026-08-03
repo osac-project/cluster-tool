@@ -75,9 +75,12 @@ if __name__ == "__main__":
     run(["cluster-tool", "flavors", "--delete", FLAVOR_NAME, "--server", SERVER], check=False)
     cluster_tool("snapshot", "--name", FLAVOR_NAME, "--source", SOURCE, "--server", SERVER)
 
-    print("[6/6] Pushing to registry...")
-    cluster_tool("push", FLAVOR_NAME, "--registry", REGISTRY, "--tag", FLAVOR_NAME, "--server", SERVER)
+    if os.environ.get("SKIP_PUSH", "").lower() in ("1", "true", "yes"):
+        print("[6/6] Skipping push (SKIP_PUSH is set)")
+    else:
+        print("[6/6] Pushing to registry...")
+        cluster_tool("push", FLAVOR_NAME, "--registry", REGISTRY, "--tag", FLAVOR_NAME, "--server", SERVER)
 
     print()
-    print(f"=== Base snapshot '{FLAVOR_NAME}' created and pushed ===")
-    print(f"Image: {REGISTRY}:{FLAVOR_NAME}")
+    print(f"=== Base snapshot '{FLAVOR_NAME}' created ===")
+    print(f"Flavor: {FLAVOR_NAME}")

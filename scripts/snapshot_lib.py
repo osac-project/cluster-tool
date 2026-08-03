@@ -19,6 +19,7 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -35,7 +36,7 @@ class SnapshotConfig:
     flavor_name: str
     values_file: str
     extra_health_checks: list[HealthCheck] = field(default_factory=list)
-    pre_setup: callable = field(default=lambda: None)
+    pre_setup: Callable[[], None] = field(default=lambda: None)
     server: str = field(default_factory=lambda: os.environ.get("SERVER", "rdu07"))
     base_flavor: str = field(default_factory=lambda: os.environ.get("BASE_FLAVOR", "sno-4-22"))
     pull_secret: Path = field(default_factory=lambda: Path(os.environ.get("PULL_SECRET", str(DEFAULT_PULL_SECRET))))
@@ -52,10 +53,11 @@ class HealthCheck:
 
 
 def run(args: list[str], *, check: bool = True, capture: bool = False,
-        env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        env: dict[str, str] | None = None,
+        cwd: str | Path | None = None) -> subprocess.CompletedProcess[str]:
     print(f"  $ {' '.join(args)}")
     return subprocess.run(args, check=check, text=True, capture_output=capture,
-                          cwd=str(INSTALLER_DIR), env=env)
+                          cwd=str(cwd) if cwd else None, env=env)
 
 
 def oc(*args: str, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess[str]:
@@ -101,7 +103,11 @@ def check_no_crashing_pods(namespace: str) -> None:
     crashing: list[str] = []
     for pod in data["items"]:
         name: str = pod["metadata"]["name"]
-        for cs in pod.get("status", {}).get("containerStatuses", []):
+        all_statuses = (
+            pod.get("status", {}).get("initContainerStatuses", [])
+            + pod.get("status", {}).get("containerStatuses", [])
+        )
+        for cs in all_statuses:
             restarts: int = cs.get("restartCount", 0)
             if restarts > 3:
                 crashing.append(f"  {name}/{cs['name']}: {restarts} restarts")
@@ -160,7 +166,7 @@ def run_health_checks(extra_checks: list[HealthCheck]) -> None:
         elif hc.command == "wait":
             oc("wait", *hc.args, "--timeout=120s")
         else:
-            oc(*hc.args.split() if isinstance(hc.args, str) else hc.args)
+            raise ValueError(f"Unknown health check command: {hc.command}")
         print(f"  OK: {hc.name}")
 
     print("--- Database ---")
@@ -328,7 +334,7 @@ def create_snapshot(config: SnapshotConfig) -> None:
     make_env = os.environ.copy()
     make_env["VALUES_FILE"] = config.values_file
     make_env["INSTALLER_NAMESPACE"] = NAMESPACE
-    run(["make", "install"], env=make_env)
+    run(["make", "install"], env=make_env, cwd=INSTALLER_DIR)
     print("  Waiting 60s for everything to settle...")
     time.sleep(60)
 
@@ -357,11 +363,14 @@ def create_snapshot(config: SnapshotConfig) -> None:
     cluster_tool("snapshot", "--name", config.flavor_name,
                  "--source", config.flavor_name, "--server", config.server)
 
-    # Step 10: Push
-    print("[10/10] Pushing to registry...")
-    cluster_tool("push", config.flavor_name, "--registry", REGISTRY,
-                 "--tag", config.flavor_name, "--server", config.server)
+    # Step 10: Push (skippable for CI validate-then-publish pipelines)
+    if os.environ.get("SKIP_PUSH", "").lower() in ("1", "true", "yes"):
+        print("[10/10] Skipping push (SKIP_PUSH is set)")
+    else:
+        print("[10/10] Pushing to registry...")
+        cluster_tool("push", config.flavor_name, "--registry", REGISTRY,
+                     "--tag", config.flavor_name, "--server", config.server)
 
     print()
-    print(f"=== Snapshot {config.flavor_name} created and pushed ===")
-    print(f"Image: {REGISTRY}:{config.flavor_name}")
+    print(f"=== Snapshot {config.flavor_name} created ===")
+    print(f"Flavor: {config.flavor_name}")
