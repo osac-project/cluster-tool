@@ -56,6 +56,7 @@ on:
 jobs:
   validate:
     runs-on: [self-hosted, clustertool-snapshot]
+    timeout-minutes: 90
     permissions:
       contents: read
     outputs:
@@ -72,7 +73,7 @@ jobs:
       # Setup
       # ------------------------------------------------------------------
       - name: Checkout cluster-tool
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
 
@@ -119,8 +120,6 @@ jobs:
             sudo ip link delete "${br}" 2>/dev/null || true
           done
 
-          sudo python3 ./cluster-tool cleanup-haproxy 2>/dev/null || true
-
       - name: Pull flavor
         env:
           FLAVOR_IMAGE: ${{ steps.flavor.outputs.image }}
@@ -164,13 +163,6 @@ jobs:
             https://github.com/osac-project/osac-installer.git \
             "${INSTALLER_DIR}"
           cd "${INSTALLER_DIR}"
-
-          # Ensure helm is available
-          if ! command -v helm &>/dev/null; then
-            curl -fsSL \
-              https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 \
-              | bash
-          fi
 
           # refresh-after-snapshot.py fixes stale routes/certs, adopts
           # Helm resources, runs helm upgrade, and waits for health.
