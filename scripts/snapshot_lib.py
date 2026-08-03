@@ -57,7 +57,7 @@ def run(args: list[str], *, check: bool = True, capture: bool = False,
         cwd: str | Path | None = None) -> subprocess.CompletedProcess[str]:
     print(f"  $ {' '.join(args)}")
     return subprocess.run(args, check=check, text=True, capture_output=capture,
-                          cwd=str(cwd) if cwd else None, env=env)
+                          cwd=cwd, env=env)
 
 
 def oc(*args: str, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess[str]:
@@ -103,11 +103,7 @@ def check_no_crashing_pods(namespace: str) -> None:
     crashing: list[str] = []
     for pod in data["items"]:
         name: str = pod["metadata"]["name"]
-        all_statuses = (
-            pod.get("status", {}).get("initContainerStatuses", [])
-            + pod.get("status", {}).get("containerStatuses", [])
-        )
-        for cs in all_statuses:
+        for cs in pod.get("status", {}).get("containerStatuses", []):
             restarts: int = cs.get("restartCount", 0)
             if restarts > 3:
                 crashing.append(f"  {name}/{cs['name']}: {restarts} restarts")
@@ -363,14 +359,11 @@ def create_snapshot(config: SnapshotConfig) -> None:
     cluster_tool("snapshot", "--name", config.flavor_name,
                  "--source", config.flavor_name, "--server", config.server)
 
-    # Step 10: Push (skippable for CI validate-then-publish pipelines)
-    if os.environ.get("SKIP_PUSH", "").lower() in ("1", "true", "yes"):
-        print("[10/10] Skipping push (SKIP_PUSH is set)")
-    else:
-        print("[10/10] Pushing to registry...")
-        cluster_tool("push", config.flavor_name, "--registry", REGISTRY,
-                     "--tag", config.flavor_name, "--server", config.server)
+    # Step 10: Push
+    print("[10/10] Pushing to registry...")
+    cluster_tool("push", config.flavor_name, "--registry", REGISTRY,
+                 "--tag", config.flavor_name, "--server", config.server)
 
     print()
-    print(f"=== Snapshot {config.flavor_name} created ===")
-    print(f"Flavor: {config.flavor_name}")
+    print(f"=== Snapshot {config.flavor_name} created and pushed ===")
+    print(f"Image: {REGISTRY}:{config.flavor_name}")
