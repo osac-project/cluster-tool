@@ -20,24 +20,34 @@ on:
         description: "Clone ID of running source cluster (8 hex chars from virsh list)"
         required: true
         type: string
-  push:
-    branches: [main]
-    paths: ["scripts/**"]
 
 permissions: {}
 
 concurrency:
-  group: build-base-sno-${{ inputs.ocp_version || '4-22' }}
+  group: build-base-sno-${{ inputs.ocp_version }}
   cancel-in-progress: false
 
 jobs:
   build-snapshot:
     runs-on: [self-hosted, clustertool-snapshot]
-    if: >-
-      github.event_name == 'workflow_dispatch'
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:
+      - name: Validate inputs
+        run: |
+          if ! echo "$OCP_VERSION" | grep -qE '^[0-9]+-[0-9]+$'; then
+            echo "ERROR: ocp_version must match pattern N-N (e.g. 4-22)"
+            exit 1
+          fi
+          if ! echo "$SOURCE" | grep -qE '^[a-f0-9]{8}$'; then
+            echo "ERROR: source must be an 8-char hex clone ID"
+            exit 1
+          fi
+        env:
+          OCP_VERSION: ${{ inputs.ocp_version }}
+          SOURCE: ${{ inputs.source }}
+
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -60,20 +70,28 @@ jobs:
       - name: Write pull secret
         run: |
           umask 077
-          echo "$PULL_SECRET" > /tmp/pull-secret.json
+          printf '%s' "$PULL_SECRET" > "${RUNNER_TEMP}/pull-secret.json"
         env:
           PULL_SECRET: ${{ secrets.PULL_SECRET }}
 
       - name: Create base snapshot
         run: |
+          KUBECONFIG="$HOME/.kube/${SOURCE}.kubeconfig"
+          export KUBECONFIG
           python3 scripts/snapshot_base.py
         env:
           SOURCE: ${{ inputs.source }}
-          KUBECONFIG: ${{ format('{0}/.kube/{1}.kubeconfig', env.HOME, inputs.source) }}
+          SKIP_PUSH: "true"
+
+      - name: Clean up pull secret
+        if: always()
+        run: |
+          rm -f "${RUNNER_TEMP}/pull-secret.json"
 
   validate-snapshot:
     needs: build-snapshot
     runs-on: [self-hosted, clustertool-snapshot]
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -88,18 +106,23 @@ jobs:
         env:
           OCP_VERSION: ${{ inputs.ocp_version }}
 
+      - name: Write pull secret
+        run: |
+          umask 077
+          printf '%s' "$PULL_SECRET" > "${RUNNER_TEMP}/pull-secret.json"
+        env:
+          PULL_SECRET: ${{ secrets.PULL_SECRET }}
+
       - name: Boot cluster from snapshot
         run: |
           ./cluster-tool boot \
             --flavor "$FLAVOR_NAME" \
             --name validate \
-            --pull-secret /tmp/pull-secret.json
+            --pull-secret "${RUNNER_TEMP}/pull-secret.json"
 
       - name: Validate nodes are Ready
         run: |
           export KUBECONFIG="$HOME/.kube/validate.kubeconfig"
-          echo "Checking node status..."
-          oc get nodes
           NODE_STATUS=$(oc get nodes -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}')
           if [ "$NODE_STATUS" != "True" ]; then
             echo "ERROR: Node is not Ready (status: $NODE_STATUS)"
@@ -110,8 +133,6 @@ jobs:
       - name: Validate ClusterOperators
         run: |
           export KUBECONFIG="$HOME/.kube/validate.kubeconfig"
-          echo "Checking ClusterOperator status..."
-          oc get co
 
           DEGRADED=$(oc get co -o json | \
             python3 -c "
@@ -150,11 +171,17 @@ jobs:
       - name: Destroy validation cluster
         if: always()
         run: |
-          ./cluster-tool destroy validate || true
+          ./cluster-tool destroy validate
+
+      - name: Clean up pull secret
+        if: always()
+        run: |
+          rm -f "${RUNNER_TEMP}/pull-secret.json"
 
   publish-snapshot:
     needs: validate-snapshot
     runs-on: [self-hosted, clustertool-snapshot]
+    timeout-minutes: 30
     if: success()
     permissions:
       contents: read
@@ -172,8 +199,3 @@ jobs:
         env:
           FLAVOR_NAME: sno-${{ inputs.ocp_version }}
           REGISTRY: ${{ vars.QUAY_REGISTRY || 'quay.io/osac-project/cluster-flavors' }}
-
-      - name: Clean up pull secret
-        if: always()
-        run: |
-          rm -f /tmp/pull-secret.json
