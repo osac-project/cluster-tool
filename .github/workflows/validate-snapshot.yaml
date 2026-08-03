@@ -55,7 +55,7 @@ on:
 
 jobs:
   validate:
-    runs-on: [self-hosted, baremetal]
+    runs-on: [self-hosted, clustertool-snapshot]
     permissions:
       contents: read
     outputs:
