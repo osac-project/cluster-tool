@@ -359,6 +359,7 @@ jobs:
           path: ${{ runner.temp }}/test-output/
 
       - name: Promote snapshot
+        if: steps.test.outcome == 'success'
         run: |
           skopeo copy \
             "docker://${REGISTRY}:vmaas-4-22-candidate-${{ github.run_id }}" \
@@ -536,6 +537,7 @@ jobs:
           path: ${{ runner.temp }}/test-output/
 
       - name: Promote snapshot
+        if: steps.test.outcome == 'success'
         run: |
           skopeo copy \
             "docker://${REGISTRY}:caas-4-22-candidate-${{ github.run_id }}" \
