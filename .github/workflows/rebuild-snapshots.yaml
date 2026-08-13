@@ -38,6 +38,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Read AppRole credentials
         id: approle
@@ -204,18 +206,22 @@ jobs:
     steps:
       - name: Checkout cluster-tool
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Checkout osac monorepo
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: osac-project/osac
           path: osac
+          persist-credentials: false
 
       - name: Checkout osac-test-infra
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: osac-project/osac-test-infra
           path: osac-test-infra
+          persist-credentials: false
 
       - name: Read AppRole credentials
         id: approle
@@ -382,18 +388,22 @@ jobs:
     steps:
       - name: Checkout cluster-tool
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Checkout osac monorepo
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: osac-project/osac
           path: osac
+          persist-credentials: false
 
       - name: Checkout osac-test-infra
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: osac-project/osac-test-infra
           path: osac-test-infra
+          persist-credentials: false
 
       - name: Read AppRole credentials
         id: approle

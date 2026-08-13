@@ -19,6 +19,7 @@ import base64
 import json
 import os
 import sys
+import time
 
 from snapshot_lib import (
     check_cluster_operators, cluster_tool, oc, oc_json, run,
@@ -62,6 +63,8 @@ if __name__ == "__main__":
 
     print("[2/6] Applying kubeletconfig (maxPods=500)...")
     oc("apply", "-f", str(KUBELETCONFIG))
+    print("  Waiting 30s for MCO to observe the change...")
+    time.sleep(30)
     oc("wait", "--for=condition=Updated", "mcp/master", "--timeout=600s")
     print("  KubeletConfig applied and MCP rolled out")
 
