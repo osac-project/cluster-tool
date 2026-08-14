@@ -104,7 +104,7 @@ jobs:
 
       - name: Pull base flavor
         run: |
-          sudo ./cluster-tool pull sno-4-22 --registry "${REGISTRY}"
+          sudo ./cluster-tool pull "${REGISTRY}:sno-4-22"
 
       - name: Boot rebuild clone
         run: |
@@ -119,7 +119,7 @@ jobs:
           SNAPSHOT_TAG: sno-4-22-candidate-${{ github.run_id }}
         run: |
           export KUBECONFIG="${HOME}/.kube/rebuild-base.kubeconfig"
-          python3 scripts/snapshot_base.py
+          sudo python3 scripts/snapshot_base.py
           echo "candidate-tag=sno-4-22-candidate-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
           echo "candidate-image=${REGISTRY}:sno-4-22-candidate-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
 
@@ -302,7 +302,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         run: |
           IMAGE="${{ inputs.base-flavor-image }}"
-          sudo ./cluster-tool pull "${IMAGE##*:}" --registry "${IMAGE%:*}"
+          sudo ./cluster-tool pull "$IMAGE"
 
       - name: Build VMaaS snapshot
         env:
@@ -311,7 +311,7 @@ jobs:
           SNAPSHOT_TAG: vmaas-4-22-candidate-${{ github.run_id }}
           BASE_FLAVOR: ${{ steps.base.outputs.flavor }}
         run: |
-          python3 scripts/snapshot_vmaas.py
+          sudo python3 scripts/snapshot_vmaas.py
 
       - name: Destroy build clone
         run: |
@@ -488,7 +488,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         run: |
           IMAGE="${{ inputs.base-flavor-image }}"
-          sudo ./cluster-tool pull "${IMAGE##*:}" --registry "${IMAGE%:*}"
+          sudo ./cluster-tool pull "$IMAGE"
 
       - name: Build CaaS snapshot
         env:
@@ -497,7 +497,7 @@ jobs:
           SNAPSHOT_TAG: caas-4-22-candidate-${{ github.run_id }}
           BASE_FLAVOR: ${{ steps.base.outputs.flavor }}
         run: |
-          python3 scripts/snapshot_caas.py
+          sudo python3 scripts/snapshot_caas.py
 
       - name: Destroy build clone
         run: |
