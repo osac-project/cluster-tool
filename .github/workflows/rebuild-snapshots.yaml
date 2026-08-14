@@ -1,0 +1,571 @@
+name: Rebuild Snapshots
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      flavor:
+        description: "Which snapshot flavor to build"
+        type: choice
+        options:
+          - vmaas
+          - caas
+      base-flavor-image:
+        description: "Base flavor OCI image to build from"
+        type: string
+        default: "quay.io/osac-project/cluster-flavors:sno-4-22"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rebuild-snapshots
+  cancel-in-progress: false
+
+env:
+  REGISTRY: quay.io/osac-project/cluster-flavors
+
+jobs:
+  # ── Base SNO: build candidate ────────────────────────────────────────
+  build-base-sno:
+    if: github.event_name == 'push'
+    runs-on: [self-hosted, clustertool-snapshot]
+    timeout-minutes: 60
+    outputs:
+      candidate-image: ${{ steps.build.outputs.candidate-image }}
+      candidate-tag: ${{ steps.build.outputs.candidate-tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Read AppRole credentials
+        id: approle
+        run: |
+          APPROLE_DIR="${HOME}/.vault-server/.approle"
+          ROLE_ID="$(cat "${APPROLE_DIR}/role-id")"
+          SECRET_ID="$(cat "${APPROLE_DIR}/secret-id")"
+          echo "role-id=${ROLE_ID}" >> "$GITHUB_OUTPUT"
+          echo "::add-mask::${SECRET_ID}"
+          echo "secret-id=${SECRET_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch secrets from Vault
+        id: vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc # v4
+        with:
+          url: http://127.0.0.1:8200
+          method: approle
+          roleId: ${{ steps.approle.outputs.role-id }}
+          secretId: ${{ steps.approle.outputs.secret-id }}
+          exportEnv: false
+          secrets: |
+            secret/data/osac/e2e/pull-secret dockerconfigjson | PULL_SECRET ;
+            secret/data/osac/e2e/aap-license license | AAP_LICENSE ;
+            secret/data/osac/e2e/snapshot-registry dockerconfigjson | SNAPSHOT_REGISTRY_AUTH
+
+      - name: Write secrets to disk
+        env:
+          PULL_SECRET: ${{ steps.vault.outputs.PULL_SECRET }}
+          AAP_LICENSE: ${{ steps.vault.outputs.AAP_LICENSE }}
+          SNAPSHOT_REGISTRY_AUTH: ${{ steps.vault.outputs.SNAPSHOT_REGISTRY_AUTH }}
+        run: |
+          mkdir -p "${HOME}/.config/containers"
+          jq -s '.[0].auths * .[1].auths | {auths: .}' \
+            <(printf '%s' "${PULL_SECRET}") \
+            <(printf '%s' "${SNAPSHOT_REGISTRY_AUTH}") \
+            > "${HOME}/.config/containers/auth.json"
+          chmod 600 "${HOME}/.config/containers/auth.json"
+          sudo mkdir -p /root/.config/containers
+          sudo cp "${HOME}/.config/containers/auth.json" /root/.config/containers/auth.json
+          sudo chmod 600 /root/.config/containers/auth.json
+          printf '%s' "${PULL_SECRET}" > "$RUNNER_TEMP/pull-secret.json"
+          chmod 600 "$RUNNER_TEMP/pull-secret.json"
+          printf '%s' "${AAP_LICENSE}" | base64 -d > "$RUNNER_TEMP/aap-license.zip"
+          chmod 600 "$RUNNER_TEMP/aap-license.zip"
+
+      - name: Configure cluster-tool
+        run: |
+          CT_CONFIG="${HOME}/.config/cluster-tool"
+          ROOT_CONFIG="/root/.config/cluster-tool"
+          if [[ -f "${CT_CONFIG}/servers.json" ]] && [[ -f "${CT_CONFIG}/state.json" ]]; then
+            echo "cluster-tool already configured."
+          elif [[ -f "${ROOT_CONFIG}/servers.json" ]]; then
+            echo "Syncing cluster-tool config from root..."
+            mkdir -p "${CT_CONFIG}"
+            sudo cp "${ROOT_CONFIG}"/{config,servers.json,state.json,cluster-tool.key,cluster-tool.key.pub} \
+              "${CT_CONFIG}/" 2>/dev/null || true
+            sudo chown -R "$(id -u):$(id -g)" "${CT_CONFIG}"
+          else
+            echo "ERROR: cluster-tool not configured." >&2
+            exit 1
+          fi
+
+      - name: Pull base flavor
+        run: |
+          sudo ./cluster-tool pull "${REGISTRY}:sno-4-22"
+
+      - name: Boot rebuild clone
+        run: |
+          sudo ./cluster-tool boot --flavor sno-4-22 --name rebuild-base \
+            --pull-secret "$RUNNER_TEMP/pull-secret.json"
+
+      - name: Build base snapshot
+        id: build
+        env:
+          SOURCE: rebuild-base
+          FLAVOR_NAME: sno-4-22
+          SNAPSHOT_TAG: sno-4-22-candidate-${{ github.run_id }}
+        run: |
+          export KUBECONFIG="${HOME}/.kube/rebuild-base.kubeconfig"
+          sudo python3 scripts/snapshot_base.py
+          echo "candidate-tag=sno-4-22-candidate-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+          echo "candidate-image=${REGISTRY}:sno-4-22-candidate-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          sudo ./cluster-tool destroy rebuild-base || true
+          rm -f "$RUNNER_TEMP/pull-secret.json" "$RUNNER_TEMP/aap-license.zip"
+
+  # ── Base SNO: validate via reusable E2E workflows ────────────────────
+  validate-base-vmaas:
+    if: github.event_name == 'push'
+    needs: build-base-sno
+    uses: osac-project/osac-test-infra/.github/workflows/e2e-vmaas-full-install.yml@main
+    with:
+      flavor-image: ${{ needs.build-base-sno.outputs.candidate-image }}
+      flavor-name: ${{ needs.build-base-sno.outputs.candidate-tag }}
+      components: '[]'
+      installer-repo: osac-project/osac
+      installer-ref: main
+      test-infra-repository: osac-project/osac-test-infra
+      test-infra-ref: main
+
+  validate-base-caas:
+    if: github.event_name == 'push'
+    needs: build-base-sno
+    uses: osac-project/osac-test-infra/.github/workflows/e2e-caas-full-install.yml@main
+    with:
+      flavor-image: ${{ needs.build-base-sno.outputs.candidate-image }}
+      flavor-name: ${{ needs.build-base-sno.outputs.candidate-tag }}
+      components: '[]'
+      installer-repo: osac-project/osac
+      installer-ref: main
+      test-infra-repository: osac-project/osac-test-infra
+      test-infra-ref: main
+
+  # ── Base SNO: promote candidate to production tag ────────────────────
+  promote-base-sno:
+    if: github.event_name == 'push'
+    needs: [build-base-sno, validate-base-vmaas, validate-base-caas]
+    runs-on: [self-hosted, clustertool-snapshot]
+    timeout-minutes: 15
+    steps:
+      - name: Read AppRole credentials
+        id: approle
+        run: |
+          APPROLE_DIR="${HOME}/.vault-server/.approle"
+          ROLE_ID="$(cat "${APPROLE_DIR}/role-id")"
+          SECRET_ID="$(cat "${APPROLE_DIR}/secret-id")"
+          echo "role-id=${ROLE_ID}" >> "$GITHUB_OUTPUT"
+          echo "::add-mask::${SECRET_ID}"
+          echo "secret-id=${SECRET_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch registry auth from Vault
+        id: vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc # v4
+        with:
+          url: http://127.0.0.1:8200
+          method: approle
+          roleId: ${{ steps.approle.outputs.role-id }}
+          secretId: ${{ steps.approle.outputs.secret-id }}
+          exportEnv: false
+          secrets: |
+            secret/data/osac/e2e/snapshot-registry dockerconfigjson | SNAPSHOT_REGISTRY_AUTH
+
+      - name: Promote snapshot
+        env:
+          SNAPSHOT_REGISTRY_AUTH: ${{ steps.vault.outputs.SNAPSHOT_REGISTRY_AUTH }}
+          CANDIDATE_IMAGE: ${{ needs.build-base-sno.outputs.candidate-image }}
+        run: |
+          mkdir -p "${HOME}/.config/containers"
+          printf '%s' "${SNAPSHOT_REGISTRY_AUTH}" > "${HOME}/.config/containers/auth.json"
+          chmod 600 "${HOME}/.config/containers/auth.json"
+          sudo mkdir -p /root/.config/containers
+          sudo cp "${HOME}/.config/containers/auth.json" /root/.config/containers/auth.json
+          skopeo copy "docker://${CANDIDATE_IMAGE}" \
+            "docker://${REGISTRY}:sno-4-22"
+
+  # ── VMaaS: build, validate in-place, promote ─────────────────────────
+  build-and-validate-vmaas:
+    needs: [promote-base-sno]
+    if: |
+      always() &&
+      (github.event_name == 'push' && needs.promote-base-sno.result == 'success') ||
+      (github.event_name == 'workflow_dispatch' && inputs.flavor == 'vmaas')
+    runs-on: [self-hosted, clustertool-snapshot]
+    timeout-minutes: 180
+    steps:
+      - name: Checkout cluster-tool
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Checkout osac monorepo
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: osac-project/osac
+          path: osac
+          persist-credentials: false
+
+      - name: Checkout osac-test-infra
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: osac-project/osac-test-infra
+          path: osac-test-infra
+          persist-credentials: false
+
+      - name: Read AppRole credentials
+        id: approle
+        run: |
+          APPROLE_DIR="${HOME}/.vault-server/.approle"
+          ROLE_ID="$(cat "${APPROLE_DIR}/role-id")"
+          SECRET_ID="$(cat "${APPROLE_DIR}/secret-id")"
+          echo "role-id=${ROLE_ID}" >> "$GITHUB_OUTPUT"
+          echo "::add-mask::${SECRET_ID}"
+          echo "secret-id=${SECRET_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch secrets from Vault
+        id: vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc # v4
+        with:
+          url: http://127.0.0.1:8200
+          method: approle
+          roleId: ${{ steps.approle.outputs.role-id }}
+          secretId: ${{ steps.approle.outputs.secret-id }}
+          exportEnv: false
+          secrets: |
+            secret/data/osac/e2e/pull-secret dockerconfigjson | PULL_SECRET ;
+            secret/data/osac/e2e/aap-license license | AAP_LICENSE ;
+            secret/data/osac/e2e/snapshot-registry dockerconfigjson | SNAPSHOT_REGISTRY_AUTH
+
+      - name: Write secrets to disk
+        env:
+          PULL_SECRET: ${{ steps.vault.outputs.PULL_SECRET }}
+          AAP_LICENSE: ${{ steps.vault.outputs.AAP_LICENSE }}
+          SNAPSHOT_REGISTRY_AUTH: ${{ steps.vault.outputs.SNAPSHOT_REGISTRY_AUTH }}
+        run: |
+          mkdir -p "${HOME}/.config/containers"
+          jq -s '.[0].auths * .[1].auths | {auths: .}' \
+            <(printf '%s' "${PULL_SECRET}") \
+            <(printf '%s' "${SNAPSHOT_REGISTRY_AUTH}") \
+            > "${HOME}/.config/containers/auth.json"
+          chmod 600 "${HOME}/.config/containers/auth.json"
+          sudo mkdir -p /root/.config/containers
+          sudo cp "${HOME}/.config/containers/auth.json" /root/.config/containers/auth.json
+          sudo chmod 600 /root/.config/containers/auth.json
+          printf '%s' "${PULL_SECRET}" > "$RUNNER_TEMP/pull-secret.json"
+          chmod 600 "$RUNNER_TEMP/pull-secret.json"
+          printf '%s' "${AAP_LICENSE}" | base64 -d > "$RUNNER_TEMP/aap-license.zip"
+          chmod 600 "$RUNNER_TEMP/aap-license.zip"
+
+      - name: Configure cluster-tool
+        run: |
+          CT_CONFIG="${HOME}/.config/cluster-tool"
+          ROOT_CONFIG="/root/.config/cluster-tool"
+          if [[ -f "${CT_CONFIG}/servers.json" ]] && [[ -f "${CT_CONFIG}/state.json" ]]; then
+            echo "cluster-tool already configured."
+          elif [[ -f "${ROOT_CONFIG}/servers.json" ]]; then
+            echo "Syncing cluster-tool config from root..."
+            mkdir -p "${CT_CONFIG}"
+            sudo cp "${ROOT_CONFIG}"/{config,servers.json,state.json,cluster-tool.key,cluster-tool.key.pub} \
+              "${CT_CONFIG}/" 2>/dev/null || true
+            sudo chown -R "$(id -u):$(id -g)" "${CT_CONFIG}"
+          else
+            echo "ERROR: cluster-tool not configured." >&2
+            exit 1
+          fi
+
+      - name: Determine base flavor
+        id: base
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            IMAGE="${{ inputs.base-flavor-image }}"
+            echo "flavor=${IMAGE##*:}" >> "$GITHUB_OUTPUT"
+          else
+            echo "flavor=sno-4-22" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pull base flavor (dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          IMAGE="${{ inputs.base-flavor-image }}"
+          sudo ./cluster-tool pull "$IMAGE"
+
+      - name: Build VMaaS snapshot
+        env:
+          INSTALLER_DIR: ${{ github.workspace }}/osac/osac-installer
+          PULL_SECRET: ${{ runner.temp }}/pull-secret.json
+          SNAPSHOT_TAG: vmaas-4-22-candidate-${{ github.run_id }}
+          BASE_FLAVOR: ${{ steps.base.outputs.flavor }}
+        run: |
+          sudo python3 scripts/snapshot_vmaas.py
+
+      - name: Destroy build clone
+        run: |
+          sudo ./cluster-tool destroy vmaas-4-22
+
+      - name: Boot validation clone
+        run: |
+          sudo ./cluster-tool boot --flavor vmaas-4-22 --name validate-vmaas \
+            --pull-secret "$RUNNER_TEMP/pull-secret.json"
+
+      - name: Copy kubeconfig
+        run: |
+          sudo cp "${HOME}/.kube/validate-vmaas.kubeconfig" "$RUNNER_TEMP/kubeconfig"
+          sudo chown "$(id -u):$(id -g)" "$RUNNER_TEMP/kubeconfig"
+
+      - name: Refresh OSAC deployment
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+          INSTALLER_NAMESPACE: osac-e2e-ci
+        run: |
+          cd "${{ github.workspace }}/osac/osac-installer"
+          python3 scripts/refresh-after-snapshot.py
+
+      - name: Build test container
+        run: |
+          podman build --no-cache \
+            -t "osac-e2e-validate:${{ github.run_id }}" \
+            -f "${{ github.workspace }}/osac-test-infra/Containerfile" \
+            "${{ github.workspace }}/osac-test-infra"
+
+      - name: Run E2E tests
+        id: test
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+        run: |
+          mkdir -p "$RUNNER_TEMP/test-output"
+          podman run --rm --network=host \
+            -v "${KUBECONFIG}":/root/.kube/config:ro,Z \
+            -v "$RUNNER_TEMP/pull-secret.json":/root/pull-secret:ro,Z \
+            -v "$RUNNER_TEMP/aap-license.zip":/root/aap-license.zip:ro,Z \
+            -v "$RUNNER_TEMP/test-output":/tmp/test-output:Z \
+            -e KUBECONFIG=/root/.kube/config \
+            -e OSAC_VM_KUBECONFIG=/root/.kube/config \
+            -e OSAC_NAMESPACE=osac-e2e-ci \
+            -e OSAC_PULL_SECRET_PATH=/root/pull-secret \
+            "osac-e2e-validate:${{ github.run_id }}" \
+            pytest tests/vmaas/ \
+              --junitxml=/tmp/test-output/junit.xml -v
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: vmaas-e2e-results
+          path: ${{ runner.temp }}/test-output/
+
+      - name: Promote snapshot
+        if: steps.test.outcome == 'success'
+        run: |
+          skopeo copy \
+            "docker://${REGISTRY}:vmaas-4-22-candidate-${{ github.run_id }}" \
+            "docker://${REGISTRY}:vmaas-4-22"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          sudo ./cluster-tool destroy vmaas-4-22 || true
+          sudo ./cluster-tool destroy validate-vmaas || true
+          podman rmi "osac-e2e-validate:${{ github.run_id }}" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/pull-secret.json" "$RUNNER_TEMP/aap-license.zip" \
+            "$RUNNER_TEMP/kubeconfig"
+
+  # ── CaaS: build, validate in-place, promote ──────────────────────────
+  build-and-validate-caas:
+    needs: [promote-base-sno]
+    if: |
+      always() &&
+      (github.event_name == 'push' && needs.promote-base-sno.result == 'success') ||
+      (github.event_name == 'workflow_dispatch' && inputs.flavor == 'caas')
+    runs-on: [self-hosted, clustertool-snapshot]
+    timeout-minutes: 180
+    steps:
+      - name: Checkout cluster-tool
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Checkout osac monorepo
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: osac-project/osac
+          path: osac
+          persist-credentials: false
+
+      - name: Checkout osac-test-infra
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: osac-project/osac-test-infra
+          path: osac-test-infra
+          persist-credentials: false
+
+      - name: Read AppRole credentials
+        id: approle
+        run: |
+          APPROLE_DIR="${HOME}/.vault-server/.approle"
+          ROLE_ID="$(cat "${APPROLE_DIR}/role-id")"
+          SECRET_ID="$(cat "${APPROLE_DIR}/secret-id")"
+          echo "role-id=${ROLE_ID}" >> "$GITHUB_OUTPUT"
+          echo "::add-mask::${SECRET_ID}"
+          echo "secret-id=${SECRET_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch secrets from Vault
+        id: vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc # v4
+        with:
+          url: http://127.0.0.1:8200
+          method: approle
+          roleId: ${{ steps.approle.outputs.role-id }}
+          secretId: ${{ steps.approle.outputs.secret-id }}
+          exportEnv: false
+          secrets: |
+            secret/data/osac/e2e/pull-secret dockerconfigjson | PULL_SECRET ;
+            secret/data/osac/e2e/aap-license license | AAP_LICENSE ;
+            secret/data/osac/e2e/snapshot-registry dockerconfigjson | SNAPSHOT_REGISTRY_AUTH
+
+      - name: Write secrets to disk
+        env:
+          PULL_SECRET: ${{ steps.vault.outputs.PULL_SECRET }}
+          AAP_LICENSE: ${{ steps.vault.outputs.AAP_LICENSE }}
+          SNAPSHOT_REGISTRY_AUTH: ${{ steps.vault.outputs.SNAPSHOT_REGISTRY_AUTH }}
+        run: |
+          mkdir -p "${HOME}/.config/containers"
+          jq -s '.[0].auths * .[1].auths | {auths: .}' \
+            <(printf '%s' "${PULL_SECRET}") \
+            <(printf '%s' "${SNAPSHOT_REGISTRY_AUTH}") \
+            > "${HOME}/.config/containers/auth.json"
+          chmod 600 "${HOME}/.config/containers/auth.json"
+          sudo mkdir -p /root/.config/containers
+          sudo cp "${HOME}/.config/containers/auth.json" /root/.config/containers/auth.json
+          sudo chmod 600 /root/.config/containers/auth.json
+          printf '%s' "${PULL_SECRET}" > "$RUNNER_TEMP/pull-secret.json"
+          chmod 600 "$RUNNER_TEMP/pull-secret.json"
+          printf '%s' "${AAP_LICENSE}" | base64 -d > "$RUNNER_TEMP/aap-license.zip"
+          chmod 600 "$RUNNER_TEMP/aap-license.zip"
+
+      - name: Configure cluster-tool
+        run: |
+          CT_CONFIG="${HOME}/.config/cluster-tool"
+          ROOT_CONFIG="/root/.config/cluster-tool"
+          if [[ -f "${CT_CONFIG}/servers.json" ]] && [[ -f "${CT_CONFIG}/state.json" ]]; then
+            echo "cluster-tool already configured."
+          elif [[ -f "${ROOT_CONFIG}/servers.json" ]]; then
+            echo "Syncing cluster-tool config from root..."
+            mkdir -p "${CT_CONFIG}"
+            sudo cp "${ROOT_CONFIG}"/{config,servers.json,state.json,cluster-tool.key,cluster-tool.key.pub} \
+              "${CT_CONFIG}/" 2>/dev/null || true
+            sudo chown -R "$(id -u):$(id -g)" "${CT_CONFIG}"
+          else
+            echo "ERROR: cluster-tool not configured." >&2
+            exit 1
+          fi
+
+      - name: Determine base flavor
+        id: base
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            IMAGE="${{ inputs.base-flavor-image }}"
+            echo "flavor=${IMAGE##*:}" >> "$GITHUB_OUTPUT"
+          else
+            echo "flavor=sno-4-22" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pull base flavor (dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          IMAGE="${{ inputs.base-flavor-image }}"
+          sudo ./cluster-tool pull "$IMAGE"
+
+      - name: Build CaaS snapshot
+        env:
+          INSTALLER_DIR: ${{ github.workspace }}/osac/osac-installer
+          PULL_SECRET: ${{ runner.temp }}/pull-secret.json
+          SNAPSHOT_TAG: caas-4-22-candidate-${{ github.run_id }}
+          BASE_FLAVOR: ${{ steps.base.outputs.flavor }}
+        run: |
+          sudo python3 scripts/snapshot_caas.py
+
+      - name: Destroy build clone
+        run: |
+          sudo ./cluster-tool destroy caas-4-22
+
+      - name: Boot validation clone
+        run: |
+          sudo ./cluster-tool boot --flavor caas-4-22 --name validate-caas \
+            --pull-secret "$RUNNER_TEMP/pull-secret.json"
+
+      - name: Copy kubeconfig
+        run: |
+          sudo cp "${HOME}/.kube/validate-caas.kubeconfig" "$RUNNER_TEMP/kubeconfig"
+          sudo chown "$(id -u):$(id -g)" "$RUNNER_TEMP/kubeconfig"
+
+      - name: Refresh OSAC deployment
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+          INSTALLER_NAMESPACE: osac-e2e-ci
+        run: |
+          cd "${{ github.workspace }}/osac/osac-installer"
+          python3 scripts/refresh-after-snapshot.py
+
+      - name: Build test container
+        run: |
+          podman build --no-cache \
+            -t "osac-e2e-validate:${{ github.run_id }}" \
+            -f "${{ github.workspace }}/osac-test-infra/Containerfile" \
+            "${{ github.workspace }}/osac-test-infra"
+
+      - name: Run E2E tests
+        id: test
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+        run: |
+          mkdir -p "$RUNNER_TEMP/test-output"
+          podman run --rm --network=host \
+            -v "${KUBECONFIG}":/root/.kube/config:ro,Z \
+            -v "$RUNNER_TEMP/pull-secret.json":/root/pull-secret:ro,Z \
+            -v "$RUNNER_TEMP/aap-license.zip":/root/aap-license.zip:ro,Z \
+            -v "$RUNNER_TEMP/test-output":/tmp/test-output:Z \
+            -e KUBECONFIG=/root/.kube/config \
+            -e OSAC_VM_KUBECONFIG=/root/.kube/config \
+            -e OSAC_NAMESPACE=osac-e2e-ci \
+            -e OSAC_PULL_SECRET_PATH=/root/pull-secret \
+            "osac-e2e-validate:${{ github.run_id }}" \
+            pytest tests/caas/ \
+              --junitxml=/tmp/test-output/junit.xml -v
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: caas-e2e-results
+          path: ${{ runner.temp }}/test-output/
+
+      - name: Promote snapshot
+        if: steps.test.outcome == 'success'
+        run: |
+          skopeo copy \
+            "docker://${REGISTRY}:caas-4-22-candidate-${{ github.run_id }}" \
+            "docker://${REGISTRY}:caas-4-22"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          sudo ./cluster-tool destroy caas-4-22 || true
+          sudo ./cluster-tool destroy validate-caas || true
+          podman rmi "osac-e2e-validate:${{ github.run_id }}" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/pull-secret.json" "$RUNNER_TEMP/aap-license.zip" \
+            "$RUNNER_TEMP/kubeconfig"
