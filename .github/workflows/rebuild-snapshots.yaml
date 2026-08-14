@@ -200,7 +200,11 @@ jobs:
 
   # ── VMaaS: build, validate in-place, promote ─────────────────────────
   build-and-validate-vmaas:
-    if: github.event_name == 'push' || inputs.flavor == 'vmaas'
+    needs: [promote-base-sno]
+    if: |
+      always() &&
+      (github.event_name == 'push' && needs.promote-base-sno.result == 'success') ||
+      (github.event_name == 'workflow_dispatch' && inputs.flavor == 'vmaas')
     runs-on: [self-hosted, clustertool-snapshot]
     timeout-minutes: 180
     steps:
@@ -382,7 +386,11 @@ jobs:
 
   # ── CaaS: build, validate in-place, promote ──────────────────────────
   build-and-validate-caas:
-    if: github.event_name == 'push' || inputs.flavor == 'caas'
+    needs: [promote-base-sno]
+    if: |
+      always() &&
+      (github.event_name == 'push' && needs.promote-base-sno.result == 'success') ||
+      (github.event_name == 'workflow_dispatch' && inputs.flavor == 'caas')
     runs-on: [self-hosted, clustertool-snapshot]
     timeout-minutes: 180
     steps:
