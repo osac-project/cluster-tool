@@ -1066,10 +1066,11 @@ def cmd_boot(args):
         kc_path = "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig"
         oc_vm = f"sudo oc --kubeconfig={kc_path} --insecure-skip-tls-verify"
         env.run_vm(vm_ip,
-            f"echo {ps_b64} | base64 -d > /tmp/ps.json && "
+            "ps_file=$(mktemp /tmp/cluster-tool-pull-secret.XXXXXX) && "
+            "trap 'rm -f \"$ps_file\"' EXIT && "
+            f"printf '%s' {shlex.quote(ps_b64)} | base64 -d > \"$ps_file\" && "
             f"{oc_vm} set data secret/pull-secret -n openshift-config "
-            f"--from-file=.dockerconfigjson=/tmp/ps.json && "
-            f"rm /tmp/ps.json",
+            f"--from-file=.dockerconfigjson=\"$ps_file\"",
             identity=key_path)
 
         print_step(6, total, "Waiting for cluster health", "done")

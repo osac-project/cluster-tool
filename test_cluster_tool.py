@@ -2647,6 +2647,10 @@ class TestPullSecretInjection(unittest.TestCase):
                 "pull secret must be set after API health check")
             self.assertLess(set_idx, co_idx,
                 "pull secret must be set before operator check")
+            self.assertIn("mktemp /tmp/cluster-tool-pull-secret.XXXXXX", oc_set_cmds[0])
+            self.assertIn("rm -f", oc_set_cmds[0])
+            self.assertIn("$ps_file", oc_set_cmds[0])
+            self.assertNotIn("/tmp/ps.json", oc_set_cmds[0])
         finally:
             os.unlink(ps_path)
             ct.KUBECONFIG_DIR.joinpath("aabbccdd.kubeconfig").unlink(missing_ok=True)
@@ -2693,4 +2697,3 @@ class TestPullSecretInjection(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
