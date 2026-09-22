@@ -1673,6 +1673,7 @@ def _setup_server(*, data_path=None):
     env.run("setsebool -P haproxy_connect_any 1")
     env.run("if systemctl is-active firewalld &>/dev/null; then "
             "firewall-cmd --permanent --add-port=6443/tcp --add-port=443/tcp --add-port=80/tcp && "
+            "firewall-cmd --permanent --zone=libvirt --add-port=6443/tcp --add-port=443/tcp --add-port=80/tcp && "
             "firewall-cmd --reload; fi")
     env.run("systemctl enable --now haproxy")
     env.run("systemctl restart haproxy")
