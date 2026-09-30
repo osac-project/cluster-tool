@@ -896,7 +896,7 @@ def cmd_boot(args):
 
     vm_emulator, vm_machine_type = resolve_vm_platform()
 
-    total = 9
+    total = 10
     print(f'Creating clone "{clone_id}"...')
     cleanup = []
 
@@ -1074,7 +1074,60 @@ def cmd_boot(args):
 
         print_step(6, total, "Waiting for cluster health", "done")
 
-        print_step(7, total, "Configuring access")
+        print_step(7, total, "Waiting for pull-secret rollout")
+        kc_path = "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig"
+        oc_vm = f"sudo oc --kubeconfig={kc_path} --insecure-skip-tls-verify"
+
+        # recert writes kubelet's config.json straight to disk instead of
+        # through MCO, so machine-config-daemon boots believing the
+        # rendered-master MachineConfig's content doesn't match what's on
+        # disk and can latch Degraded ("content mismatch for file
+        # /var/lib/kubelet/config.json"). Until MCP master reports Updated,
+        # the node's kubelet may still be running with the stale/empty
+        # authfile baked into the snapshot, so anything that pulls an
+        # authenticated image right after boot (metal3, marketplace
+        # catalogs, etc.) can race it and fail. Force a resync and wait,
+        # mirroring infra/netris/roles/restore-snapshot's recovery for the
+        # same recert side effect.
+        env.run_vm(vm_ip, "sudo touch /run/machine-config-daemon-force", identity=key_path)
+
+        def mcp_master_updated():
+            r = env.run_vm(
+                vm_ip,
+                f"{oc_vm} get mcp/master -o jsonpath='{{.status.conditions[?(@.type==\"Updated\")].status}}'",
+                check=False, identity=key_path,
+            )
+            return r.returncode == 0 and r.stdout.strip() == "True"
+
+        synced = False
+        for _ in range(90):
+            if mcp_master_updated():
+                synced = True
+                break
+            time.sleep(10)
+
+        if not synced:
+            r = env.run_vm(vm_ip, f"{oc_vm} get nodes -o jsonpath='{{.items[0].metadata.name}}'", identity=key_path)
+            node_name = r.stdout.strip()
+            env.run_vm(
+                vm_ip,
+                f"{oc_vm} patch node {node_name} --type merge --patch "
+                f"'{{\"metadata\":{{\"annotations\":{{\"machineconfiguration.openshift.io/reason\":\"\","
+                f"\"machineconfiguration.openshift.io/state\":\"Done\"}}}}}}'",
+                identity=key_path,
+            )
+            env.run_vm(vm_ip, f"{oc_vm} delete pod -n openshift-machine-config-operator -l k8s-app=machine-config-daemon", identity=key_path)
+            for _ in range(60):
+                if mcp_master_updated():
+                    synced = True
+                    break
+                time.sleep(10)
+
+        if not synced:
+            sys.exit("MachineConfigPool 'master' not Updated after pull-secret rollout (30 minutes).")
+        print_step(7, total, "Waiting for pull-secret rollout", "done")
+
+        print_step(8, total, "Configuring access")
         kubeconfig_path = KUBECONFIG_DIR / f"{clone_id}.kubeconfig"
         KUBECONFIG_DIR.mkdir(parents=True, exist_ok=True)
         _restore_ownership(KUBECONFIG_DIR)
@@ -1092,9 +1145,9 @@ def cmd_boot(args):
         cleanup.append(("haproxy", clone_id))
         add_dns_entry(clone_id)
         cleanup.append(("dns", clone_id))
-        print_step(7, total, "Configuring access", "done")
+        print_step(8, total, "Configuring access", "done")
 
-        print_step(8, total, "Waiting for operators")
+        print_step(9, total, "Waiting for operators")
         kc_path = "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig"
         oc_vm = f"sudo oc --kubeconfig={kc_path} --insecure-skip-tls-verify"
         node_ready = False
@@ -1160,11 +1213,11 @@ def cmd_boot(args):
         else:
             detail = "\n".join(f"  - {u}" for u in last_unhealthy)
             sys.exit(f"Operators not healthy after 20 minutes.\nUnhealthy operators:\n{detail}")
-        print_step(8, total, "Waiting for operators", f"done ({len(items)}/{len(items)})")
+        print_step(9, total, "Waiting for operators", f"done ({len(items)}/{len(items)})")
 
-        print_step(9, total, "Verifying cluster identity")
+        print_step(10, total, "Verifying cluster identity")
         verify_cluster_identity(vm_ip, clone_id, domain, identity=key_path)
-        print_step(9, total, "Verifying cluster identity", "done")
+        print_step(10, total, "Verifying cluster identity", "done")
 
     except (SystemExit, subprocess.CalledProcessError) as e:
         if args.no_rollback:

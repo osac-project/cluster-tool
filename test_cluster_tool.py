@@ -509,6 +509,8 @@ class TestTransactionalBoot(unittest.TestCase):
             r.returncode = 0
             if "ingress-cn" in cmd:
                 r.stdout = "fake-ingress-cn"
+            elif "mcp/master" in cmd and "jsonpath" in cmd:
+                r.stdout = "True"
             elif "virsh destroy " in cmd:
                 destroyed.add(cmd.split("virsh destroy ")[1])
                 r.stdout = ""
@@ -688,6 +690,8 @@ class TestTransactionalBoot(unittest.TestCase):
             r.returncode = 0
             if "ingress-cn" in cmd:
                 r.stdout = "fake-ingress-cn"
+            elif "mcp/master" in cmd and "jsonpath" in cmd:
+                r.stdout = "True"
             elif "infrastructure cluster" in cmd:
                 r.stdout = "https://api.test-infra-cluster-aabbccdd.redhat.com:6443"
             elif "get co -o json" in cmd:
@@ -909,6 +913,8 @@ class TestTransactionalBoot(unittest.TestCase):
             r.returncode = 0
             if "ingress-cn" in cmd:
                 r.stdout = "fake-ingress-cn"
+            elif "mcp/master" in cmd and "jsonpath" in cmd:
+                r.stdout = "True"
             elif "infrastructure cluster" in cmd:
                 r.stdout = "https://api.test-infra-cluster-6ef80144.redhat.com:6443"
             elif "get co -o json" in cmd:
@@ -942,6 +948,8 @@ class TestTransactionalBoot(unittest.TestCase):
             r.returncode = 0
             if "ingress-cn" in cmd:
                 r.stdout = "fake-ingress-cn"
+            elif "mcp/master" in cmd and "jsonpath" in cmd:
+                r.stdout = "True"
             elif "get nodes -o json" in cmd:
                 r.stdout = mock_nodes_not_ready
             elif "get nodes -o wide" in cmd:
@@ -979,6 +987,8 @@ class TestTransactionalBoot(unittest.TestCase):
             r.returncode = 0
             if "ingress-cn" in cmd:
                 r.stdout = "fake-ingress-cn"
+            elif "mcp/master" in cmd and "jsonpath" in cmd:
+                r.stdout = "True"
             elif "get co -o json" in cmd:
                 r.stdout = mock_co_bad
             elif "get nodes -o json" in cmd:
@@ -1015,6 +1025,8 @@ class TestTransactionalBoot(unittest.TestCase):
             r.returncode = 0
             if "ingress-cn" in cmd:
                 r.stdout = "fake-ingress-cn"
+            elif "mcp/master" in cmd and "jsonpath" in cmd:
+                r.stdout = "True"
             elif "infrastructure cluster" in cmd:
                 r.stdout = "https://api.test-infra-cluster-aabbccdd.redhat.com:6443"
             elif "get co -o json" in cmd:
@@ -1089,6 +1101,8 @@ class TestTransactionalBoot(unittest.TestCase):
             r.returncode = 0
             if "ingress-cn" in cmd:
                 r.stdout = "fake-ingress-cn"
+            elif "mcp/master" in cmd and "jsonpath" in cmd:
+                r.stdout = "True"
             elif "infrastructure cluster" in cmd:
                 r.stdout = "https://api.test-infra-cluster-aabbccdd.redhat.com:6443"
             elif "get co -o json" in cmd:
@@ -2585,6 +2599,8 @@ class TestPullSecretInjection(unittest.TestCase):
             r.returncode = 0
             if "ingress-cn" in cmd:
                 r.stdout = "fake-ingress-cn"
+            elif "mcp/master" in cmd and "jsonpath" in cmd:
+                r.stdout = "True"
             elif "infrastructure cluster" in cmd:
                 r.stdout = "https://api.test-infra-cluster-aabbccdd.redhat.com:6443"
             elif "get co -o json" in cmd:
@@ -2689,6 +2705,111 @@ class TestPullSecretInjection(unittest.TestCase):
         self.assertIn("--pull=missing", recert_cmd)
         self.assertNotIn("--pull=newer", recert_cmd)
         ct.KUBECONFIG_DIR.joinpath("aabbccdd.kubeconfig").unlink(missing_ok=True)
+
+
+class TestPullSecretRollout(unittest.TestCase):
+    _INITIAL_STATE = TestTransactionalBoot._INITIAL_STATE
+
+    def setUp(self):
+        self.mock_env = MockStateEnv()
+        self.mock_env.setup(self._INITIAL_STATE)
+        self.calls = []
+        self._ps_file = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+        json.dump({"auths": {"quay.io": {"auth": "dGVzdA=="}}}, self._ps_file)
+        self._ps_file.close()
+
+    def tearDown(self):
+        os.unlink(self._ps_file.name)
+        ct.KUBECONFIG_DIR.joinpath("aabbccdd.kubeconfig").unlink(missing_ok=True)
+
+    def _boot_args(self):
+        return argparse.Namespace(name="aabbccdd", flavor="default", no_rollback=False,
+                                  pull_secret=self._ps_file.name)
+
+    def _make_ssh(self, *, mcp_master_true_after=0):
+        """mcp_master_true_after: number of not-yet-synced responses before
+        the jsonpath query starts reporting Updated=True. 0 means it's
+        synced from the first check."""
+        mock_co = TestTransactionalBoot._MOCK_CO_JSON
+        mock_nodes = TestTransactionalBoot._MOCK_NODES_JSON
+        state = {"mcp_checks": 0}
+
+        def ssh(cmd, check=True):
+            self.calls.append((cmd, check))
+            r = MagicMock()
+            r.returncode = 0
+            if "ingress-cn" in cmd:
+                r.stdout = "fake-ingress-cn"
+            elif "mcp/master" in cmd and "jsonpath" in cmd:
+                state["mcp_checks"] += 1
+                r.stdout = "True" if state["mcp_checks"] > mcp_master_true_after else "False"
+            elif "get nodes -o jsonpath" in cmd:
+                r.stdout = "test-infra-cluster-aabbccdd-master-0"
+            elif "infrastructure cluster" in cmd:
+                r.stdout = "https://api.test-infra-cluster-aabbccdd.redhat.com:6443"
+            elif "get co -o json" in cmd:
+                r.stdout = mock_co
+            elif "get nodes -o json" in cmd:
+                r.stdout = mock_nodes
+            else:
+                r.stdout = "ok"
+            r.stderr = ""
+            return r
+        return ssh
+
+    @patch("time.sleep")
+    @patch.object(ct, "remove_dns_entry")
+    @patch.object(ct, "remove_haproxy_clone")
+    @patch.object(ct, "add_dns_entry")
+    def test_boot_forces_mcd_resync_after_pull_secret_set(self, *_):
+        ssh = self.mock_env.wrap_run_positional(self._make_ssh())
+        with patch.object(ct.env, "run", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_boot(self._boot_args())
+
+        cmds = [cmd for cmd, _ in self.calls]
+        force_idx = next(i for i, c in enumerate(cmds) if "machine-config-daemon-force" in c)
+        set_idx = next(i for i, c in enumerate(cmds) if "set data secret/pull-secret" in c)
+        mcp_idx = next(i for i, c in enumerate(cmds) if "mcp/master" in c and "jsonpath" in c)
+        access_idx = next(i for i, c in enumerate(cmds) if "static-pod-resources/kube-apiserver-certs" in c and "cat " in c)
+        self.assertGreater(force_idx, set_idx,
+            "MCD resync must be forced after the real pull secret is set")
+        self.assertGreater(mcp_idx, force_idx,
+            "must wait for MachineConfigPool after forcing the resync")
+        self.assertGreater(access_idx, mcp_idx,
+            "must not configure access/kubeconfig before the pull secret has rolled out")
+
+    @patch("time.sleep")
+    @patch.object(ct, "remove_dns_entry")
+    @patch.object(ct, "remove_haproxy_clone")
+    @patch.object(ct, "add_dns_entry")
+    def test_boot_self_heals_stuck_degraded_mcp(self, *_):
+        # Not synced on the first pass (all 90 checks in the loop fail),
+        # but recovers once the self-heal path clears the stuck annotation
+        # and restarts machine-config-daemon.
+        ssh = self.mock_env.wrap_run_positional(self._make_ssh(mcp_master_true_after=90))
+        with patch.object(ct.env, "run", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_boot(self._boot_args())
+
+        cmds = [cmd for cmd, _ in self.calls]
+        self.assertTrue(any("patch node" in c and "machineconfiguration.openshift.io/state" in c for c in cmds),
+            "must clear the stuck degraded annotation as part of self-heal")
+        self.assertTrue(any("delete pod -n openshift-machine-config-operator" in c and "machine-config-daemon" in c for c in cmds),
+            "must restart machine-config-daemon as part of self-heal")
+
+    @patch("time.sleep")
+    @patch.object(ct, "remove_dns_entry")
+    @patch.object(ct, "remove_haproxy_clone")
+    @patch.object(ct, "add_dns_entry")
+    def test_boot_exits_if_mcp_master_never_syncs(self, *_):
+        ssh = self.mock_env.wrap_run_positional(self._make_ssh(mcp_master_true_after=99999))
+        with patch.object(ct.env, "run", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            with self.assertRaises(SystemExit) as ctx:
+                ct.cmd_boot(self._boot_args())
+        self.assertIn("MachineConfigPool", str(ctx.exception))
+        self.assertIn("not Updated", str(ctx.exception))
 
 
 if __name__ == "__main__":
