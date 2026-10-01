@@ -6,6 +6,7 @@ import functools
 import json
 import os
 import random
+import re
 import shlex
 import subprocess
 import sys
@@ -1467,9 +1468,13 @@ def cmd_pull(args):
             r = env.run(f"skopeo copy docker://{image_ref} dir:{tmp}/oci", check=False)
             if r.returncode == 0:
                 break
+            stderr = r.stderr.strip()
+            if re.search(r"unauthorized|denied|authentication required", stderr, re.IGNORECASE):
+                sys.exit(f"Pull failed due to authentication error: {stderr}\n"
+                         f"Hint: run 'skopeo login <registry>' on this server first.")
             if attempt == max_attempts:
-                sys.exit(f"Pull failed after {max_attempts} attempts: {r.stderr.strip()}")
-            print(f"  Pull attempt {attempt}/{max_attempts} failed, retrying in 60s...")
+                sys.exit(f"Pull failed after {max_attempts} attempts: {stderr}")
+            print(f"  Pull attempt {attempt}/{max_attempts} failed, retrying in 60s...\n  Error: {stderr}")
             time.sleep(60)
         print_step(1, total, "Downloading from registry", "done")
 
