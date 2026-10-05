@@ -868,6 +868,14 @@ def cmd_boot(args):
         src_secondary = flavor["source_secondary_subnet"]
         memory_kib = flavor["memory_kib"]
         vcpus = flavor["vcpus"]
+        if args.vcpus is not None:
+            vcpus = args.vcpus
+        if args.memory_kib is not None:
+            memory_kib = args.memory_kib
+        if vcpus < 1:
+            sys.exit("--vcpus must be at least 1")
+        if memory_kib < 1:
+            sys.exit("--memory-kib must be at least 1")
         etcd_image = flavor["etcd_image"]
         disk_names = flavor["disks"]
         fdir = flavor_dir(flavor_name)
@@ -1773,6 +1781,8 @@ def main():
     boot_p.add_argument("--name", help="Clone ID (random if omitted)")
     boot_p.add_argument("--no-rollback", action="store_true", help="Preserve failed clone for debugging (don't rollback on failure)")
     boot_p.add_argument("--pull-secret", required=True, help="Path to pull-secret.json to inject after cluster boots")
+    boot_p.add_argument("--vcpus", type=int, default=None, help="Override vCPU count from flavor (integer)")
+    boot_p.add_argument("--memory-kib", type=int, default=None, help="Override memory from flavor, in KiB (integer)")
 
     list_p = sub.add_parser("list", help="Show running clones")
 
