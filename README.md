@@ -1,6 +1,6 @@
 # cluster-tool
 
-Instant OpenShift SNO clusters from snapshots. Distribute them as OCI images.
+Clone OpenShift SNO and three-master compact clusters. Distribute reusable flavors as OCI images.
 
 ## The Problem
 
@@ -8,16 +8,16 @@ Installing an OpenShift Single Node cluster takes 30-45 minutes. For development
 
 ## The Solution
 
-`cluster-tool` snapshots a running SNO cluster's VM disk, then boots independent clones from that snapshot in ~5 minutes. Each clone gets a unique identity — new cluster name, new certificates, new IP, new hostname — via the [recert](https://github.com/rh-ecosystem-edge/recert) tool.
+`cluster-tool` snapshots a running SNO cluster's VM disk, then boots independent clones from that snapshot. For three-master compact clusters, use `compact-clone` to clone a live source or `compact-boot` to boot a pulled compact flavor. Each clone gets a unique identity — new cluster name, certificates, IP, and hostname — via the [recert](https://github.com/rh-ecosystem-edge/recert) tool.
 
-Flavors can be pushed to an OCI registry (Quay.io) and pulled on any baremetal machine. A new developer can go from nothing to a running OpenShift cluster with CNV, MCE, or LVMS pre-installed in ~20 minutes.
+Flavors can be pushed to an OCI registry (Quay.io) and pulled on any baremetal machine. For the OSAC CI workflow, use a bare OpenShift flavor and install OSAC dependencies after the clone is ready. SNO pull-and-boot takes about 15–20 minutes; compact-clone readiness includes additional control-plane convergence.
 
 **Before:** 45 minutes to install a cluster from scratch.
 **After:** ~5 minutes to boot a clone, ~20 minutes including pull from registry.
 
 ## Concepts
 
-**Flavor** — A reusable cluster template. It's a directory containing golden qcow2 disk image(s), SSH keys, CA signing keys, and VM specs (RAM, vCPUs). You create a flavor by snapshotting a running cluster, then boot new clusters from it. Examples: `osac-vmaas` (SNO with OSAC VMAAS), `osac-caas` (SNO with OSAC CAAS).
+**Flavor** — A reusable cluster template. It contains golden qcow2 disk images, SSH and CA keys, and VM specs (RAM and vCPUs). It captures the cluster state at snapshot time. For the OSAC CI workflow, use a bare OpenShift flavor and install OSAC, OpenBao, and local storage after the clone boots.
 
 ## Installation
 
@@ -210,6 +210,46 @@ For CI, use `local` as the host when running directly on the baremetal machine:
 | `destroy ID\|--all [--server S]` | Tear down a clone. |
 | `push NAME --registry REPO --tag TAG [--server S]` | Push a flavor to an OCI registry. Splits, compresses, builds multi-layer image. |
 | `pull IMAGE [--server S]` | Pull a flavor from an OCI registry. Downloads, decompresses, reassembles, registers. |
+| `inspect --source SOURCE --host HOST [--network NETWORK]` | Read-only inspection of a live three-master compact source. |
+| `compact-heal --source SOURCE --host HOST --clone-id ID --subnet N [--network NETWORK] [--ingress-cn CN]` | Print the proposed compact-clone heal plan. It does not change the source or apply the plan. |
+| `compact-clone --source SOURCE --host HOST --clone-id ID --subnet N [--identity KEY] [--memory-kib N] [--vcpus N] [--resume STAGE]` | Create a clone directly from a live three-master source, restore etcd, run Recert, and heal the clone. |
+| `compact-boot --flavor FLAVOR --name ID --host HOST [--subnet N] [--identity KEY] [--pull-secret FILE] [--memory-kib N] [--vcpus N] [--resume STAGE]` | Boot and heal a pulled three-master compact flavor. If omitted, the subnet is allocated automatically. |
+
+### Compact three-master workflow
+
+The compact commands are separate from the single-node `boot` workflow. Use `inspect` to read the source and `compact-heal` to preview the changes for a clone. Both are read-only. `compact-heal --apply` is not an apply operation; it checks that the requested subnet is not the source subnet and directs you to `compact-clone` to perform the clone.
+
+`--source` accepts the source cluster name prefix before `-master-0-0` or a cluster-tool source ID. `--host` accepts `local` or an SSH target such as `root@hypervisor`. Set `--network` only when the source network does not match the discovered default.
+
+```bash
+SOURCE=test-infra-cluster-bare
+HOST=local
+CLONE=compact-test
+SUBNET=220
+
+# Inspect a live source and preview the clone heal.
+./cluster-tool inspect --source "$SOURCE" --host "$HOST"
+./cluster-tool compact-heal \
+  --source "$SOURCE" --host "$HOST" \
+  --clone-id "$CLONE" --subnet "$SUBNET"
+
+# Clone directly from the live source.
+./cluster-tool compact-clone \
+  --source "$SOURCE" --host "$HOST" \
+  --clone-id "$CLONE" --subnet "$SUBNET"
+```
+
+To boot from a flavor instead, pull the flavor onto the target server first, then use `compact-boot`:
+
+```bash
+IMAGE=quay.io/example/cluster-flavors:mno-3node
+./cluster-tool pull "$IMAGE" --server local
+./cluster-tool compact-boot \
+  --flavor mno-3node --name compact-test --host local \
+  --pull-secret /path/to/pull-secret.json
+```
+
+`--pull-secret` is optional and takes a path to a valid OpenShift pull-secret JSON file. `--memory-kib` and `--vcpus` override the flavor's VM settings. The `--resume` options are for continuing an existing interrupted clone; they are `recert`, `heal`, and `health` for `compact-clone`, and `recert`, `rewrite`, and `health` for `compact-boot`. A successful compact boot waits for all nodes to be Ready, the master MachineConfigPool to be updated and healthy, newer etcd and kube-apiserver revisions on every master, and the required operators to remain quiet across two observations before returning.
 
 ## OCI Distribution
 
@@ -256,7 +296,7 @@ Measured timings (SNO with CNV+LVMS, 90 GB disk):
 6. Writes server config (idempotent — never overwrites existing config)
 7. Registers the server alias on the client
 
-## What Happens During Boot
+## What Happens During Single-Node Boot
 
 1. **Create disk overlay(s)** — qcow2 copy-on-write backed by the golden snapshot(s). Instant.
 2. **Create networks** — isolated libvirt NAT networks with DNS entries. Bridge names truncated to 15-char Linux limit.
@@ -353,7 +393,7 @@ Each clone gets a fully unique identity through recert:
 
 ## Internals
 
-For deep technical details on how snapshot recloning works (OVN cleanup, etcd certificate hardlinks, standalone etcd, forked recert image), see [INTERNALS.md](INTERNALS.md).
+For deep technical details on how snapshot recloning works (OVN cleanup, etcd certificate hardlinks, standalone etcd, forked recert image) and the compact-clone follow-ups still needed in automation and the flavor image, see [INTERNALS.md](INTERNALS.md).
 
 ## Testing
 

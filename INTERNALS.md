@@ -65,3 +65,9 @@ We use `quay.io/osac-project/recert:latest` with two fixes over upstream:
 
 1. **Binary DER data handling** — upstream crashes on secrets with binary certificate data. The fork returns `None` for non-UTF-8 data instead of erroring.
 2. **PersistentVolume node affinity** — upstream doesn't update PV node affinity hostnames during `--hostname`. The fork adds PV support in etcd encoding and hostname replacement.
+
+## Compact cloning
+
+`compact-clone` creates a clone directly from a live three-master source. `compact-boot` starts from a pulled compact flavor. Both paths restore the clone's etcd state, run Recert once, and apply the clone identity and recovery steps. They are implemented by `cluster-tool`; they are not baked into the OpenShift flavor. For the OSAC CI path, keep the flavor as the OpenShift baseline and install OSAC services, OpenBao, and local storage after the clone is ready. See the [README](README.md#compact-three-master-workflow) for command usage.
+
+The compact path has been exercised end to end: an earlier `edge28` run reached clone readiness and `make install-infra` succeeded. That result describes the code used for that run, not every later change. The successful `sno-pr43` run on `f4c6143` covered the single-node `boot` path; it does not validate `compact-boot` or `compact-clone` on that revision. Record the tested commit alongside future compact-run results.
