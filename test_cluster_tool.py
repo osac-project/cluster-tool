@@ -1,13 +1,18 @@
 # test_cluster_tool.py
 import argparse
+import base64
 import importlib.machinery
 import importlib.util
+import inspect
 import json
 import os
+import shlex
 import socket
 import subprocess
+import sys
 import tempfile
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -16,6 +21,17 @@ spec = importlib.util.spec_from_loader("cluster_tool", loader, origin="./cluster
 ct = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ct)
 ct._init_paths("/data/cluster-tool")
+_TEST_HOME = tempfile.TemporaryDirectory(prefix="cluster-tool-tests-")
+ct._REAL_HOME = Path(_TEST_HOME.name)
+ct.KUBECONFIG_DIR = ct._REAL_HOME / ".kube"
+ct.CLIENT_CONFIG_DIR = ct._REAL_HOME / ".config" / "cluster-tool"
+ct.CLIENT_SERVERS_FILE = ct.CLIENT_CONFIG_DIR / "servers.json"
+
+
+def _fixture_pem(kind, body):
+    marker = "-----" + "BEGIN " + kind + "-----"
+    end = "-----" + "END " + kind + "-----"
+    return f"{marker}\n{body}\n{end}".encode()
 
 
 class MockStateEnv:
@@ -410,12 +426,12 @@ class TestTemplates(unittest.TestCase):
 class TestDnsEntry(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
-        self._orig_dnsmasq_dir = ct.DNSMASQ_DIR
-        ct.DNSMASQ_DIR = Path(self.tmpdir)
+        self._orig_dnsmasq_dir = ct._dnsmasq_dir
+        ct._dnsmasq_dir = lambda: Path(self.tmpdir)
         ct.env = ct.ExecutionEnv(host="test@host", host_ip="10.0.0.1")
 
     def tearDown(self):
-        ct.DNSMASQ_DIR = self._orig_dnsmasq_dir
+        ct._dnsmasq_dir = self._orig_dnsmasq_dir
 
     @patch("subprocess.run")
     def test_add_dns_entry_creates_file(self, mock_run):
@@ -487,16 +503,30 @@ class TestTransactionalBoot(unittest.TestCase):
         self.mock_env = MockStateEnv()
         self.mock_env.setup(self._INITIAL_STATE)
         self.calls = []
+        self._original_client_config_dir = ct.CLIENT_CONFIG_DIR
+        self._client_config_tmp = tempfile.TemporaryDirectory(prefix="cluster-tool-state-")
+        ct.CLIENT_CONFIG_DIR = Path(self._client_config_tmp.name)
+        self._dnsmasq_tmp = tempfile.TemporaryDirectory(prefix="cluster-tool-dnsmasq-")
+        self._dnsmasq_patch = patch.object(
+            ct, "_dnsmasq_dir", return_value=Path(self._dnsmasq_tmp.name))
+        self._dnsmasq_patch.start()
+        self._dns_reload_patch = patch.object(ct, "_reload_dns")
+        self._dns_reload_patch.start()
         self._ps_file = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
         json.dump({"auths": {"quay.io": {"auth": "dGVzdA=="}}}, self._ps_file)
         self._ps_file.close()
 
     def tearDown(self):
         os.unlink(self._ps_file.name)
+        self._dns_reload_patch.stop()
+        self._dnsmasq_patch.stop()
+        self._dnsmasq_tmp.cleanup()
+        ct.CLIENT_CONFIG_DIR = self._original_client_config_dir
+        self._client_config_tmp.cleanup()
 
     def _boot_args(self, no_rollback=False):
         return argparse.Namespace(name="aabbccdd", flavor="default", no_rollback=no_rollback,
-                                  pull_secret=self._ps_file.name)
+                                  pull_secret=self._ps_file.name, vcpus=None, memory_kib=None)
 
     def _make_ssh_mock(self, fail_on):
         destroyed = set()
@@ -1170,6 +1200,2057 @@ Used memory:    67108864 KiB"""
         self.assertEqual(subnet, 135)
 
 
+class TestCompactInspect(unittest.TestCase):
+    _NET = """<network xmlns:dnsmasq="http://libvirt.org/schemas/network/dnsmasq/1.0">
+          <name>mno-test2</name>
+          <ip address="192.168.124.1" netmask="255.255.255.0">
+            <dhcp>
+              <host mac="52:54:00:a2:b0:aa" name="master-0-0" ip="192.168.124.69"/>
+              <host mac="52:54:00:76:07:c5" name="master-0-1" ip="192.168.124.81"/>
+              <host mac="52:54:00:ba:f0:e8" name="master-0-2" ip="192.168.124.89"/>
+            </dhcp>
+          </ip>
+          <dnsmasq:options>
+            <dnsmasq:option value="address=/api.test-infra-cluster-mno.redhat.com/192.168.124.5"/>
+            <dnsmasq:option value="address=/api-int.test-infra-cluster-mno.redhat.com/192.168.124.5"/>
+            <dnsmasq:option value="address=/apps.test-infra-cluster-mno.redhat.com/192.168.124.10"/>
+          </dnsmasq:options>
+        </network>"""
+    _DOM = """<domain type="kvm"><name>{domain}</name><devices>
+          <disk type="file" device="disk">
+            <source file="/var/lib/libvirt/images/{domain}.qcow2"/>
+            <target dev="sda" bus="scsi"/>
+          </disk>
+          <interface type="network"><mac address="{mac}"/></interface>
+        </devices></domain>"""
+    _DOMINFO = "CPU(s):         16\nMax memory:     33554432 KiB\n"
+    _MACS = {
+        "mno-test2-master-0-0": "52:54:00:a2:b0:aa",
+        "mno-test2-master-0-1": "52:54:00:76:07:c5",
+        "mno-test2-master-0-2": "52:54:00:ba:f0:e8",
+    }
+
+    def test_classify_vips_from_dnsmasq_options(self):
+        api, ingress = ct.classify_vips(ct.parse_dnsmasq_addresses(self._NET))
+        self.assertEqual(api, "192.168.124.5")
+        self.assertEqual(ingress, "192.168.124.10")
+        gateway, network = ct.parse_network_gateway(self._NET)
+        self.assertEqual(gateway, "192.168.124.1")
+        self.assertEqual(network, "192.168.124.0/24")
+
+    def test_addnhosts_extend_dns(self):
+        records = ct.parse_addnhosts(
+            "192.168.124.5 api.test-infra-cluster-mno2.redhat.com api-int.test-infra-cluster-mno2.redhat.com\n"
+            "192.168.124.10 apps.test-infra-cluster-mno2.redhat.com\n")
+        self.assertEqual(records[0]["name"], "api.test-infra-cluster-mno2.redhat.com")
+        self.assertEqual(len(records), 3)
+
+    def test_dhcp_host_ips_must_be_valid_ipv4(self):
+        with self.assertRaises(ValueError):
+            ct.parse_dhcp_hosts(
+                "<network><ip><dhcp><host mac='02:00:00:00:00:01' "
+                "ip='192.168.1.1;touch /tmp/pwned'/></dhcp></ip></network>")
+        with self.assertRaises(ValueError):
+            ct.parse_dhcp_hosts(
+                "<network><ip><dhcp><host mac='02:00:00:00:00:01' "
+                "ip='2001:db8::1'/></dhcp></ip></network>")
+
+    def test_discover_compact_source_reads_three_domains(self):
+        ct.env = ct.ExecutionEnv(host="root@sealusa46", host_ip="10.0.0.1")
+
+        def fake_run(cmd, check=True):
+            r = MagicMock()
+            r.returncode = 0
+            r.stderr = ""
+            if "virsh domstate" in cmd and "master-0-" in cmd:
+                r.stdout = "running\n"
+            elif "virsh net-dumpxml" in cmd:
+                r.stdout = self._NET
+            elif cmd.startswith("cat /var/lib/libvirt/dnsmasq/"):
+                r.stdout = "192.168.124.5 api.test-infra-cluster-mno2.redhat.com\n"
+            elif "virsh dominfo" in cmd:
+                r.stdout = self._DOMINFO
+            elif "virsh dumpxml" in cmd:
+                domain = cmd.split()[-1].strip("'")
+                r.stdout = self._DOM.format(domain=domain, mac=self._MACS[domain])
+            else:
+                r.returncode = 1
+                r.stdout = ""
+                if check:
+                    raise SystemExit(cmd)
+            return r
+
+        with patch.object(ct.env, "run", side_effect=fake_run):
+            record = ct.discover_compact_source("mno-test2", network="mno-test2")
+
+        self.assertEqual(record["topology"], "compact")
+        self.assertEqual(record["machine_network"], "192.168.124.0/24")
+        self.assertEqual(record["api_vip"], "192.168.124.5")
+        self.assertEqual(record["ingress_vip"], "192.168.124.10")
+        self.assertEqual([n["ip"] for n in record["nodes"]], [
+            "192.168.124.69", "192.168.124.81", "192.168.124.89"])
+        self.assertEqual(record["nodes"][0]["disks"][0]["path"],
+                         "/var/lib/libvirt/images/mno-test2-master-0-0.qcow2")
+        self.assertEqual(record["vcpus"], 16)
+        self.assertEqual(record["memory_kib"], 33554432)
+
+    def test_missing_third_master_exits(self):
+        ct.env = ct.ExecutionEnv(host="root@host", host_ip="10.0.0.1")
+
+        def fake_run(cmd, check=True):
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = "running\n"
+            r.stderr = ""
+            if "master-0-2" in cmd:
+                r.returncode = 1
+                r.stdout = ""
+            return r
+
+        with patch.object(ct.env, "run", side_effect=fake_run):
+            with self.assertRaises(SystemExit) as ctx:
+                ct.discover_compact_source("mno-test2")
+        self.assertIn("No 3-master compact source", str(ctx.exception))
+
+    def test_compact_network_xml_round_trips(self):
+        macs = ["02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:03"]
+        nodes = ct.compact_node_plan("aabbccdd", 200, macs)
+        xml = ct.gen_compact_network_xml("aabbccdd", 200, nodes)
+        hosts = ct.parse_dhcp_hosts(xml)
+        self.assertEqual([h["ip"] for h in hosts], [
+            "192.168.200.69", "192.168.200.81", "192.168.200.89"])
+        self.assertEqual(hosts[0]["name"], "test-infra-cluster-aabbccdd-master-0-0")
+        api, ingress = ct.classify_vips(ct.parse_dnsmasq_addresses(xml))
+        self.assertEqual(api, "192.168.200.5")
+        self.assertEqual(ingress, "192.168.200.10")
+        gateway, network = ct.parse_network_gateway(xml)
+        self.assertEqual(gateway, "192.168.200.1")
+        self.assertEqual(network, "192.168.200.0/24")
+        self.assertIn("<hostname>api.test-infra-cluster-aabbccdd.redhat.com</hostname>", xml)
+        self.assertIn("<hostname>api-int.test-infra-cluster-aabbccdd.redhat.com</hostname>", xml)
+        self.assertIn(f"<bridge name='{ct.compact_bridge_name('aabbccdd')}'", xml)
+        self.assertNotEqual(ct.compact_bridge_name("compact-a"), ct.compact_bridge_name("compact-b"))
+        self.assertLessEqual(len(ct.compact_bridge_name("compact-a")), 15)
+
+    def test_compact_libvirt_names_are_checked_before_reservation(self):
+        ct.env = ct.ExecutionEnv(host="root@host", host_ip="10.0.0.1")
+        def fake_run(cmd, check=True):
+            result = MagicMock(returncode=0, stdout="", stderr="")
+            if cmd == "virsh list --all --name":
+                result.stdout = "test-infra-cluster-edge7-master-0-1\n"
+            return result
+        with patch.object(ct.env, "run", side_effect=fake_run):
+            conflicts = ct.compact_libvirt_conflicts("edge7")
+            self.assertEqual(conflicts, ["test-infra-cluster-edge7-master-0-1"])
+            with self.assertRaises(SystemExit) as ctx:
+                ct.require_compact_libvirt_names_free("edge7")
+        self.assertIn("no resources were changed", str(ctx.exception))
+
+    def test_destroy_ownership_requires_clone_disk_and_network_identity(self):
+        clone_id = "edge7"
+        nodes = ct.compact_node_plan(clone_id, 207, [
+            "02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:03"])
+        vm_xml = ct.gen_compact_vm_xml(
+            clone_id, nodes[0], [ct.compact_role_disk_dest(clone_id, nodes[0]["role"], 0)])
+        net_xml = ct.gen_compact_network_xml(clone_id, 207, nodes)
+        self.assertTrue(ct.compact_domain_owned_by_clone(vm_xml, clone_id, nodes[0]["role"]))
+        self.assertTrue(ct.compact_network_owned_by_clone(net_xml, clone_id))
+        foreign_xml = vm_xml.replace(
+            ct.compact_role_disk_dest(clone_id, nodes[0]["role"], 0),
+            "/var/lib/libvirt/images/source-master.qcow2")
+        self.assertFalse(ct.compact_domain_owned_by_clone(foreign_xml, clone_id, nodes[0]["role"]))
+        foreign_net = net_xml.replace(ct.compact_bridge_name(clone_id), "source-bridge")
+        self.assertFalse(ct.compact_network_owned_by_clone(foreign_net, clone_id))
+
+    def test_mark_compact_clone_running_only_updates_reserved_clone(self):
+        saved = {"state": {"flavors": {}, "clones": {
+            "edge7": {"topology": "compact", "status": "booting"}}}}
+        class _State:
+            def __enter__(self):
+                return saved["state"]
+            def __exit__(self, *args):
+                return False
+        with patch.object(ct, "locked_state", _State):
+            ct.mark_compact_clone_running("edge7")
+        self.assertEqual(saved["state"]["clones"]["edge7"]["status"], "running")
+        with patch.object(ct, "locked_state", _State):
+            with self.assertRaises(SystemExit):
+                ct.mark_compact_clone_running("missing")
+
+    def test_compact_vm_xml_uses_one_nic_and_virtio_disk(self):
+        nodes = ct.compact_node_plan("aabbccdd", 200, [
+            "02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:03"])
+        xml = ct.gen_compact_vm_xml(
+            "aabbccdd", nodes[1], ["/data/overlays/aabbccdd-master-0-1.qcow2"])
+        self.assertIn("<name>test-infra-cluster-aabbccdd-master-0-1</name>", xml)
+        self.assertEqual(xml.count("<interface "), 1)
+        self.assertIn("bus='virtio'", xml)
+        self.assertIn("dev='vda'", xml)
+        self.assertIn("test-infra-net-aabbccdd", xml)
+        self.assertNotIn("secondary-network", xml)
+        spare = ct.gen_compact_vm_xml(
+            "aabbccdd", nodes[0], [
+                "/data/master-0-0.qcow2",
+                "/data/master-0-0-spare.qcow2",
+            ])
+        self.assertIn("dev='vda'", spare)
+        self.assertIn("dev='vdb'", spare)
+        self.assertIn("/data/master-0-0-spare.qcow2", spare)
+        self.assertEqual(spare.count("<interface "), 1)
+
+    def test_etcd_restore_commands_share_one_snapshot(self):
+        nodes = ct.compact_node_plan("aabbccdd", 200, [
+            "02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:03"])
+        commands = ct.compact_etcd_restore_commands(
+            nodes, "/var/lib/libvirt/images/snapshot.db", "aabbccdd")
+        self.assertEqual([c["name"] for c in commands], list(ct.COMPACT_ROLES))
+        cluster = commands[0]["argv"][commands[0]["argv"].index("--initial-cluster") + 1]
+        self.assertEqual(cluster, (
+            "master-0-0=https://192.168.200.69:2380,"
+            "master-0-1=https://192.168.200.81:2380,"
+            "master-0-2=https://192.168.200.89:2380"))
+        snapshots = set()
+        for cmd in commands:
+            argv = cmd["argv"]
+            self.assertNotIn("--force-new-cluster", argv)
+            self.assertEqual(argv[0:4], ["etcdutl", "snapshot", "restore", "/var/lib/libvirt/images/snapshot.db"])
+            snapshots.add(argv[3])
+            self.assertEqual(argv[argv.index("--initial-cluster") + 1], cluster)
+            self.assertEqual(argv[argv.index("--initial-cluster-token") + 1], "aabbccdd")
+            self.assertEqual(
+                argv[argv.index("--initial-advertise-peer-urls") + 1],
+                f"https://{cmd['ip']}:2380")
+            self.assertEqual(argv[argv.index("--data-dir") + 1], f"/var/lib/etcd-restore/{cmd['name']}")
+            self.assertEqual(argv[argv.index("--name") + 1], cmd["name"])
+        self.assertEqual(snapshots, {"/var/lib/libvirt/images/snapshot.db"})
+        self.assertNotIn("--skip-hash-check", commands[0]["argv"])
+        raw = ct.compact_etcd_restore_commands(
+            nodes, "/snapshot.db", "aabbccdd", skip_hash_check=True)
+        self.assertIn("--skip-hash-check", raw[0]["argv"])
+
+    def test_etcd_restore_rejects_a_partial_membership(self):
+        with self.assertRaises(SystemExit) as ctx:
+            ct.compact_etcd_restore_commands(
+                [{"role": "master-0-0", "ip": "192.168.200.69"}],
+                "/tmp/snapshot.db", "aabbccdd")
+        self.assertIn("etcd restore needs members", str(ctx.exception))
+
+    def _source(self):
+        return {
+            "api_vip": "192.168.124.5",
+            "ingress_vip": "192.168.124.10",
+            "nodes": [
+                {"role": "master-0-0", "ip": "192.168.124.69"},
+                {"role": "master-0-1", "ip": "192.168.124.81"},
+                {"role": "master-0-2", "ip": "192.168.124.89"},
+            ],
+            "dns": [
+                {"name": "api.test-infra-cluster-mno.redhat.com", "ip": "192.168.124.5"},
+                {"name": "api-int.test-infra-cluster-mno.redhat.com", "ip": "192.168.124.5"},
+                {"name": "apps.test-infra-cluster-mno.redhat.com", "ip": "192.168.124.10"},
+                {"name": "api.test-infra-cluster-mno2.redhat.com", "ip": "192.168.124.5"},
+                {"name": "api-int.test-infra-cluster-mno2.redhat.com", "ip": "192.168.124.5"},
+            ],
+        }
+
+    def test_identity_rewrite_replaces_old_names_once(self):
+        nodes = ct.compact_node_plan("aabbccdd", 200, [
+            "02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:03"])
+        pairs = ct.compact_identity_pairs(self._source(), "aabbccdd", nodes)
+        text = "\n".join([
+            "match ^api-int.test-infra-cluster-mno.redhat.com",
+            "https://api-int.test-infra-cluster-mno2.redhat.com:6443/healthz",
+            "baseDomain: test-infra-cluster-mno.redhat.com",
+            "192.168.124.5",
+            "192.168.124.10",
+            "192.168.124.69",
+            "192.168.124.50",
+        ])
+        rewritten = ct.apply_identity(text, pairs)
+        self.assertNotIn("test-infra-cluster-mno.redhat.com", rewritten)
+        self.assertNotIn("test-infra-cluster-mno2.redhat.com", rewritten)
+        self.assertIn("api-int.test-infra-cluster-aabbccdd.redhat.com", rewritten)
+        self.assertIn("baseDomain: test-infra-cluster-aabbccdd.redhat.com", rewritten)
+        self.assertIn("192.168.200.5", rewritten)
+        self.assertIn("192.168.200.10", rewritten)
+        self.assertIn("192.168.200.69", rewritten)
+        self.assertIn("192.168.124.50", rewritten)
+
+    def test_recert_runs_once_on_the_first_master(self):
+        nodes = ct.compact_node_plan("aabbccdd", 200, [
+            "02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:03"])
+        commands = ct.recert_compact_commands(
+            self._source(), "aabbccdd", nodes, "/tmp/crypto", "ingress-operator", "/tmp/plan")
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0]["name"], "master-0-0")
+        self.assertEqual(commands[0]["argv"][commands[0]["argv"].index("--hostname") + 1], "master-0-0")
+        self.assertIn("--etcd-endpoint", commands[0]["argv"])
+        self.assertNotIn("--disk-only", commands[0]["argv"])
+        self.assertEqual(commands[0]["expected_error"], "Expected exactly one node")
+
+    def test_heal_restores_quorum_etcd_certs_and_signs_kubelets(self):
+        nodes = ct.compact_node_plan("aabbccdd", 200, [
+            "02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:03"])
+        heal = ct.compact_heal_plan(
+            self._source(), "aabbccdd", nodes, "/tmp/crypto", "ingress-operator",
+            "/tmp/plan", "/tmp/crypto/csr-signer")
+        copy = heal["etcd_cert_copy"]
+        self.assertEqual(copy["from_role"], "master-0-1")
+        self.assertEqual(copy["to_role"], "master-0-0")
+        self.assertEqual(copy["from_ip"], "192.168.200.81")
+        self.assertEqual(copy["to_ip"], "192.168.200.69")
+        self.assertIn("secrets/etcd-client/tls.crt", copy["paths"])
+        signed = {item["role"] for item in heal["kubelet_sign"]}
+        self.assertEqual(signed, set(ct.COMPACT_ROLES))
+        script = heal["kubelet_sign"][0]["script"]
+        self.assertIn("CN=system:node:master-0-0", script)
+        self.assertIn("IP:192.168.200.69", script)
+        self.assertIn("extendedKeyUsage=clientAuth", script)
+        self.assertIn("/tmp/crypto/csr-signer/tls.crt", script)
+        self.assertIn("/etc/kubernetes/static-pod-resources/coredns/Corefile.tmpl", heal["rewrite_files"])
+        self.assertIn("/etc/systemd/system/nodeip-configuration.service", heal["rewrite_files"])
+        self.assertEqual(heal["base_domain"], "test-infra-cluster-aabbccdd.redhat.com")
+        self.assertEqual(heal["ingress_domain"], "apps.test-infra-cluster-aabbccdd.redhat.com")
+        patches = ct.compact_identity_domain_patches("aabbccdd")
+        self.assertEqual(patches["dns"]["spec"]["baseDomain"], heal["base_domain"])
+        self.assertEqual(patches["ingress"]["spec"]["domain"], heal["ingress_domain"])
+        self.assertTrue(ct.compact_identity_domains_ready(
+            {"base_domain": heal["base_domain"], "apps_domain": heal["ingress_domain"]},
+            "aabbccdd"))
+        self.assertFalse(ct.compact_identity_domains_ready(
+            {"base_domain": heal["base_domain"], "apps_domain": "apps.test-infra-cluster-mno.redhat.com"},
+            "aabbccdd"))
+        crd = json.dumps({
+            "spec": {"versions": [{"schema": {"openAPIV3Schema": {"properties": {
+                "spec": {"properties": {"domain": {
+                    "type": "string",
+                    "x-kubernetes-validations": [
+                        {"message": "domain is immutable once set", "rule": "self == oldSelf"},
+                    ],
+                }}}
+            }}}}]},
+        })
+        stripped = json.loads(ct.compact_strip_ingress_domain_lock(crd))
+        domain = stripped["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]["domain"]
+        self.assertNotIn("x-kubernetes-validations", domain)
+        text = ct.format_compact_heal(heal)
+        self.assertIn("Recert runs once", text)
+        self.assertIn("Do not copy the Recert etcd CA the other way", text)
+        self.assertIn("Do not copy Recert's keys the other way", text)
+        self.assertIn("start kubelet on master-0-0", text)
+        start = ct.compact_start_recert_node_script()
+        self.assertIn("systemctl start crio", start)
+        self.assertIn("systemctl start kubelet", start)
+        self.assertNotIn("stop kubelet", start)
+        self.assertIn("ingress spec.domain", text)
+        self.assertIn("apps.test-infra-cluster-aabbccdd.redhat.com", text)
+        self.assertEqual(
+            ct.compact_ingress_wildcard_host("aabbccdd"),
+            "*.apps.test-infra-cluster-aabbccdd.redhat.com")
+        self.assertEqual(
+            ct.compact_ingresscontroller_status_patch("aabbccdd")["status"]["domain"],
+            "apps.test-infra-cluster-aabbccdd.redhat.com")
+        self.assertEqual(heal["client_trust_copy"]["from_role"], "master-0-1")
+        self.assertEqual(heal["client_trust_copy"]["to_role"], "master-0-0")
+        trust = ct.compact_apiserver_client_trust_tar_command()
+        self.assertIn("client-ca/ca-bundle.crt", trust)
+        self.assertIn("aggregator-client/tls.crt", trust)
+        self.assertIn("kubelet-client/tls.crt", trust)
+        self.assertIn("csr-signer/tls.crt", trust)
+        self.assertIn("bound-service-account-signing-key/service-account.key", trust)
+        self.assertIn("sa-token-signing-certs/service-account-", trust)
+        self.assertNotIn("etcd-serving-ca", trust)
+        digest = ct.compact_client_trust_digest_command()
+        self.assertIn("aggregator-client/tls.crt", digest)
+        self.assertIn("aggregator-client-ca/ca-bundle.crt", digest)
+        ready = [{"role": role, "ok": True} for role in ct.COMPACT_ROLES]
+        self.assertTrue(ct.compact_auth_ready(ready, ready))
+        rejected = [{"role": "master-0-0", "ok": False}] + ready[1:]
+        self.assertFalse(ct.compact_auth_ready(rejected, ready))
+        self.assertFalse(ct.compact_auth_ready(ready, rejected))
+        self.assertIn("infrastructure cluster", text)
+        self.assertNotIn("--disk-only", text)
+        self.assertNotIn("192.168.", text)
+        self.assertNotIn("--cn-san-replace", text)
+        spec, status = ct.compact_infrastructure_patches("aabbccdd", 200)
+        self.assertEqual(spec["spec"]["platformSpec"]["baremetal"]["apiServerInternalIPs"], ["192.168.200.5"])
+        self.assertEqual(status["status"]["apiServerInternalURI"], "https://api-int.test-infra-cluster-aabbccdd.redhat.com:6443")
+        self.assertEqual(status["status"]["platformStatus"]["baremetal"]["ingressIPs"], ["192.168.200.10"])
+        self.assertIn("rm -f /run/nodeip-configuration/remote-worker", ct.compact_release_keepalived_script())
+        self.assertIn(("openshift-etcd", "etcd-endpoints"), ct.HEAL_IDENTITY_CONFIGMAPS)
+        self.assertIn(("openshift-apiserver", "config"), ct.HEAL_IDENTITY_CONFIGMAPS)
+        self.assertIn(("openshift-oauth-apiserver", "apiserver"), ct.HEAL_ETCD_DEPLOYMENTS)
+        endpoints = json.dumps({"data": {"endpoints": '{"a":"https://192.168.124.69:2379"}'}})
+        rewritten = json.loads(ct.rewrite_configmap(endpoints, [("192.168.124.69", "192.168.200.69")]))
+        self.assertEqual(rewritten["data"]["endpoints"], '{"a":"https://192.168.200.69:2379"}')
+        deployment = json.dumps({
+            "metadata": {"name": "apiserver"},
+            "spec": {"template": {"spec": {"containers": [{"args": ["https://192.168.124.81:2379"]}]}}},
+            "status": {"readyReplicas": 0},
+        })
+        updated = json.loads(ct.rewrite_deployment(deployment, [("192.168.124.81", "192.168.200.81")]))
+        self.assertEqual(updated["spec"]["template"]["spec"]["containers"][0]["args"], ["https://192.168.200.81:2379"])
+        self.assertNotIn("status", updated)
+        self.assertIn("kube-apiserver-cert-regeneration-controller", ct.compact_restart_cert_controller_command())
+        self.assertEqual(
+            ct.compact_cert_controller_lease(),
+            ("openshift-kube-apiserver", "cert-regeneration-controller-lock"))
+        refresh = inspect.getsource(ct._refresh_internal_api_certificate)
+        stopped = refresh.index("compact_restart_cert_controller_command")
+        released = refresh.index("compact_cert_controller_lease")
+        no_op = refresh.index("if secret_has_clone_cert() and api_vip_has_clone_cert()")
+        self.assertLess(stopped, released)
+        self.assertLess(no_op, stopped)
+        self.assertIn("_certificate_file_has_san", refresh)
+        self.assertIn("api_deadline = time.monotonic() + 90", refresh)
+        ensure = inspect.getsource(ct._ensure_api_certificates)
+        self.assertLess(ensure.index("_secret_hostnames"), ensure.index("signing API serving certificates"))
+        self.assertNotIn("time.sleep(10)", ensure)
+        self.assertTrue(ct.presented_san_matches(
+            "DNS:api-int.test-infra-cluster-aabbccdd.redhat.com, IP Address:192.168.200.5",
+            "api-int.test-infra-cluster-aabbccdd.redhat.com"))
+        self.assertFalse(ct.presented_san_matches(
+            "DNS:kubernetes, DNS:kubernetes.default, IP Address:172.30.0.1",
+            "api-int.test-infra-cluster-aabbccdd.redhat.com"))
+
+    def test_compact_api_certificate_recovery_orders_install_before_refresh(self):
+        calls = []
+        with patch.object(ct, "_ensure_api_certificates", side_effect=lambda *args: calls.append("install")), \
+                patch.object(ct, "_refresh_internal_api_certificate", side_effect=lambda *args: calls.append("refresh")):
+            ct._recover_compact_api_certificates("oc", "/work", "example.redhat.com", "192.168.200.5", [], "key")
+        self.assertEqual(calls, ["install", "refresh"])
+
+    def test_internal_api_certificate_refresh_skips_when_vip_is_already_correct(self):
+        hostname = "api-int.test-infra-cluster-aabbccdd.redhat.com"
+        env = MagicMock()
+        env.run.return_value.returncode = 0
+        with patch.object(ct, "env", env), \
+                patch.object(ct, "_secret_hostnames", return_value=hostname), \
+                patch.object(ct, "_certificate_file_has_san", return_value=True), \
+                patch.object(ct, "_presented_san", return_value=f"DNS:{hostname}"), \
+                patch.object(ct, "_clone_log"), \
+                patch.object(ct, "_in_parallel") as parallel:
+            ct._refresh_internal_api_certificate(
+                "oc", "/work", "test-infra-cluster-aabbccdd.redhat.com", "192.168.200.5", [], "key")
+        parallel.assert_not_called()
+
+    def test_apiserver_host_ip_repair_is_bounded_and_checks_readiness(self):
+        script = ct.compact_apiserver_host_ip_script("192.168.200.89")
+
+        self.assertIn('expected=192.168.200.89', script)
+        self.assertIn("sudo crictl inspect", script)
+        self.assertIn("/etc/kubernetes/manifests/kube-apiserver-pod.yaml", script)
+        self.assertIn('e.pop("valueFrom",None)', script)
+        self.assertIn('e["value"]=sys.argv[2]', script)
+        self.assertIn('sudo restorecon -F "$manifest"', script)
+        self.assertNotIn('sudo crictl stop "$id"', script)
+        self.assertIn('https://127.0.0.1:6443/readyz', script)
+        self.assertIn("deadline=$((SECONDS + 240))", script)
+        with self.assertRaises(ValueError):
+            ct.compact_apiserver_host_ip_script("not-an-ip")
+
+    def test_compact_mcd_pod_address_rows_read_host_network_identity_and_readiness(self):
+        raw = json.dumps({"items": [
+            {
+                "metadata": {"name": "machine-config-daemon-a", "uid": "uid-a"},
+                "spec": {"nodeName": "master-0-0"},
+                "status": {"podIP": "192.168.200.69", "containerStatuses": [
+                    {"ready": True}, {"ready": True},
+                ]},
+            },
+            {
+                "metadata": {"name": "other-daemon"},
+                "spec": {"nodeName": "master-0-1"},
+                "status": {"podIP": "192.168.200.81", "containerStatuses": [
+                    {"ready": True},
+                ]},
+            },
+            {
+                "metadata": {"name": "machine-config-daemon-b", "uid": "uid-b"},
+                "spec": {"nodeName": "master-0-2"},
+                "status": {"podIP": "192.168.123.50", "containerStatuses": [
+                    {"ready": True}, {"ready": False},
+                ]},
+            },
+        ]})
+
+        self.assertEqual(ct.compact_mcd_pod_address_rows(raw), {
+            "master-0-0": {"name": "machine-config-daemon-a", "uid": "uid-a", "ip": "192.168.200.69", "ready": True},
+            "master-0-2": {"name": "machine-config-daemon-b", "uid": "uid-b", "ip": "192.168.123.50", "ready": False},
+        })
+
+    def test_compact_mcd_address_recovery_replaces_stale_daemonset_pod(self):
+        def pod(name, uid, node, ip, ready=True):
+            return json.dumps({"items": [{
+                "metadata": {"name": name, "uid": uid},
+                "spec": {"nodeName": node},
+                "status": {"podIP": ip, "containerStatuses": [{"ready": ready}]},
+            }]})
+
+        def result(stdout="", returncode=0, stderr=""):
+            value = MagicMock()
+            value.stdout = stdout
+            value.stderr = stderr
+            value.returncode = returncode
+            return value
+
+        env = MagicMock()
+        env.run.side_effect = [
+            result(pod("machine-config-daemon-old", "old-uid", "master-0-0", "192.168.123.64")),
+            result(),
+            result(pod("machine-config-daemon-new", "new-uid", "master-0-0", "192.168.200.69")),
+            result(pod("machine-config-daemon-master-1", "master-1-uid", "master-0-1", "192.168.200.81")),
+        ]
+        nodes = [
+            {"role": "master-0-0", "ip": "192.168.200.69"},
+            {"role": "master-0-1", "ip": "192.168.200.81"},
+        ]
+        with patch.object(ct, "env", env), patch.object(ct, "_clone_log"), \
+                patch.object(ct.time, "sleep"):
+            ct._ensure_compact_mcd_pod_addresses("oc", nodes, "/work")
+
+        self.assertIn(
+            "/api/v1/namespaces/openshift-machine-config-operator/pods/machine-config-daemon-old",
+            env.run.call_args_list[1].args[0],
+        )
+        self.assertIn(
+            "--data-binary '{\"apiVersion\":\"v1\",\"kind\":\"DeleteOptions\","
+            "\"preconditions\":{\"uid\":\"old-uid\"}}'",
+            env.run.call_args_list[1].args[0],
+        )
+        self.assertFalse(any("systemctl restart kubelet" in call.args[0]
+                             for call in env.run.call_args_list))
+
+    def test_compact_mcd_waits_for_correct_ip_pod_to_become_ready(self):
+        def pods(name, uid, node, ip, ready):
+            return json.dumps({"items": [{
+                "metadata": {"name": name, "uid": uid},
+                "spec": {"nodeName": node},
+                "status": {"podIP": ip, "containerStatuses": [{"ready": ready}]},
+            }]})
+
+        def result(stdout="", returncode=0, stderr=""):
+            return MagicMock(returncode=returncode, stdout=stdout, stderr=stderr)
+
+        env = MagicMock()
+        env.run.side_effect = [
+            result(pods("machine-config-daemon-stale", "stale-uid", "master-0-0", "192.168.123.64", True)),
+            result(),
+            result(pods("machine-config-daemon-current", "current-uid", "master-0-0", "192.168.200.69", False)),
+            result(pods("machine-config-daemon-current", "current-uid", "master-0-0", "192.168.200.69", False)),
+            result(pods("machine-config-daemon-current", "current-uid", "master-0-0", "192.168.200.69", True)),
+            result(pods("machine-config-daemon-master-1", "master-1-uid", "master-0-1", "192.168.200.81", True)),
+        ]
+        nodes = [
+            {"role": "master-0-0", "ip": "192.168.200.69"},
+            {"role": "master-0-1", "ip": "192.168.200.81"},
+        ]
+        with patch.object(ct, "env", env), patch.object(ct, "_clone_log"), \
+                patch.object(ct.time, "sleep"):
+            ct._ensure_compact_mcd_pod_addresses("oc", nodes, "/work")
+
+        delete_calls = [call.args[0] for call in env.run.call_args_list
+                        if "KUBE_DELETE_HTTP_STATUS" in call.args[0]]
+        self.assertEqual(len(delete_calls), 1)
+        self.assertIn("pods/machine-config-daemon-stale", delete_calls[0])
+        self.assertIn('"preconditions":{"uid":"stale-uid"}', delete_calls[0])
+
+    def test_compact_mcd_does_not_delete_pod_before_it_has_an_ip(self):
+        def pods(name, uid, node, ip, ready):
+            return json.dumps({"items": [{
+                "metadata": {"name": name, "uid": uid},
+                "spec": {"nodeName": node},
+                "status": {"podIP": ip, "containerStatuses": [{"ready": ready}]},
+            }]})
+
+        def result(stdout=""):
+            return MagicMock(returncode=0, stdout=stdout, stderr="")
+
+        env = MagicMock()
+        env.run.side_effect = [
+            result(pods("machine-config-daemon-pending", "pending-uid", "master-0-0", "", False)),
+            result(pods("machine-config-daemon-pending", "pending-uid", "master-0-0", "", False)),
+            result(pods("machine-config-daemon-current", "current-uid", "master-0-0", "192.168.200.69", False)),
+            result(pods("machine-config-daemon-current", "current-uid", "master-0-0", "192.168.200.69", True)),
+            result(pods("machine-config-daemon-master-1", "master-1-uid", "master-0-1", "192.168.200.81", True)),
+        ]
+        nodes = [
+            {"role": "master-0-0", "ip": "192.168.200.69"},
+            {"role": "master-0-1", "ip": "192.168.200.81"},
+        ]
+        with patch.object(ct, "env", env), patch.object(ct, "_clone_log"), \
+                patch.object(ct.time, "sleep"):
+            ct._ensure_compact_mcd_pod_addresses("oc", nodes, "/work")
+
+        self.assertFalse(any("KUBE_DELETE_HTTP_STATUS" in call.args[0]
+                             for call in env.run.call_args_list))
+
+    def test_api_recovery_refreshes_host_ips_and_stale_leases_before_endpoints(self):
+        source = inspect.getsource(ct._recover_compact_api_certificates_and_endpoints)
+        certs = source.index("_recover_compact_api_certificates(")
+        host_ips = source.index("_ensure_compact_apiserver_host_ips(")
+        leases = source.index("_clear_compact_stale_master_leases(")
+        endpoints = source.index("_refresh_compact_kubernetes_endpoints(")
+        self.assertLess(certs, host_ips)
+        self.assertNotIn("_ensure_compact_mcd_pod_addresses(", source)
+        self.assertLess(host_ips, leases)
+        self.assertLess(leases, endpoints)
+        finish = inspect.getsource(ct._finish_compact_clone)
+        self.assertIn("_recover_compact_api_certificates_and_endpoints(", finish)
+        ready_check = finish.index("if ready == len(nodes) and addresses_ok")
+        mcd_refresh = finish.index("_ensure_compact_mcd_pod_addresses(")
+        install_gate = finish.index("compact_install_observation_ready(")
+        self.assertLess(ready_check, mcd_refresh)
+        self.assertLess(mcd_refresh, install_gate)
+
+    def test_clone_copy_keeps_source_disks_and_reissues_etcd_certs(self):
+        source_nodes = [
+            {"role": role, "disks": [{"path": f"/var/lib/libvirt/images/mno-test2/{role}.qcow2"}]}
+            for role in ct.COMPACT_ROLES
+        ]
+        disks = ct.compact_clone_disks("ctcmp03", source_nodes)
+        commands = ct.compact_copy_commands(disks)
+        self.assertIn("cp --reflink=always", commands[1])
+        self.assertIn("/var/lib/libvirt/images/mno-test2/master-0-0.qcow2", commands[1])
+        self.assertIn("/var/lib/libvirt/images/ctcmp03/master-0-0.qcow2", commands[1])
+        spare_nodes = [
+            {"role": role, "disks": [
+                {"path": f"/flavors/bare/disk-{index}.qcow2"},
+                {"path": f"/flavors/bare/disk-{index}-spare.qcow2"},
+            ]}
+            for index, role in enumerate(ct.COMPACT_ROLES)
+        ]
+        spare_disks = ct.compact_clone_disks("edge3", spare_nodes)
+        self.assertEqual(
+            [(disk["source"], disk["dest"]) for disk in spare_disks[:2]],
+            [
+                ("/flavors/bare/disk-0.qcow2",
+                 "/var/lib/libvirt/images/edge3/master-0-0.qcow2"),
+                ("/flavors/bare/disk-0-spare.qcow2",
+                 "/var/lib/libvirt/images/edge3/master-0-0-spare.qcow2"),
+            ])
+        self.assertEqual(len(spare_disks), 6)
+        groups = ct.compact_flavor_node_disks([
+            "disk-2-spare.qcow2", "disk-0.qcow2", "disk-1-spare.qcow2",
+            "disk-2.qcow2", "disk-0-spare.qcow2", "disk-1.qcow2",
+        ])
+        self.assertEqual(groups[0], ("master-0-0", "disk-0.qcow2", "disk-0-spare.qcow2"))
+        self.assertEqual(groups[2][2], "disk-2-spare.qcow2")
+        self.assertEqual(
+            ct.compact_flavor_node_disks(["disk-0.qcow2", "disk-1.qcow2", "disk-2.qcow2"])[1],
+            ("master-0-1", "disk-1.qcow2", None))
+        nodes = ct.compact_node_plan("ctcmp03", 253, ["02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:03"])
+        script = ct.compact_etcd_reissue_script(nodes, "/work/crypto", "/work/etcd-new")
+        self.assertIn("san_for 192.168.253.69", script)
+        self.assertIn("/work/crypto/etcd-signer.crt", script)
+        self.assertIn("/work/crypto/etcd-metric-signer.key", script)
+        self.assertNotIn("--force-new-cluster", script)
+        proxy = ct.compact_proxy_command("etcd-image", ["192.168.253.81", "192.168.253.89"])
+        self.assertIn("--advertise-client-url 127.0.0.1:2379", proxy)
+        self.assertNotIn("192.168.253.69", proxy)
+        body = base64.b64encode(b"api.test-infra-cluster-mno2.redhat.com").decode()
+        pairs = [("test-infra-cluster-mno2.redhat.com", "test-infra-cluster-ctcmp03.redhat.com")]
+        unit = "ExecStart=node-ip set 192.168.124.5\n"
+        raw = json.dumps({"spec": {"config": {
+            "storage": {"files": [
+                {"contents": {"source": f"data:text/plain;charset=utf-8;base64,{body}"}}
+            ]},
+            "systemd": {"units": [{"name": "nodeip-configuration.service", "contents": unit}]},
+        }}})
+        ip_pairs = pairs + [("192.168.124.5", "192.168.253.5")]
+        rewritten = json.loads(ct.rewrite_machineconfig(raw, ip_pairs))
+        encoded = rewritten["spec"]["config"]["storage"]["files"][0]["contents"]["source"].split(",", 1)[1]
+        self.assertIn(b"test-infra-cluster-ctcmp03.redhat.com", base64.b64decode(encoded))
+        self.assertIn("192.168.253.5", rewritten["spec"]["config"]["systemd"]["units"][0]["contents"])
+        pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\nserver: api.test-infra-cluster-mno2.redhat.com\n"
+        kept = ct.apply_identity_preserving_pems(pem, pairs)
+        self.assertIn("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----", kept)
+        self.assertIn("test-infra-cluster-ctcmp03.redhat.com", kept)
+        indented = (
+            "additionalTrustBundle: |-\n"
+            "  -----BEGIN CERTIFICATE-----\n"
+            "  MIIB\n"
+            "  -----END CERTIFICATE-----\n"
+            "additionalTrustBundlePolicy: Proxyonly\n"
+            "baseDomain: test-infra-cluster-mno2.redhat.com\n")
+        rewritten_bundle = ct.apply_identity_preserving_pems(indented, pairs)
+        self.assertIn("\n  -----BEGIN CERTIFICATE-----\n  MIIB\n  -----END CERTIFICATE-----\n", rewritten_bundle)
+        self.assertIn("additionalTrustBundlePolicy: Proxyonly\n", rewritten_bundle)
+        self.assertIn("baseDomain: test-infra-cluster-ctcmp03.redhat.com\n", rewritten_bundle)
+
+    def test_compact_health_requires_three_nodes_and_operators(self):
+        nodes = ct.parse_oc_nodes(
+            "master-0-0   Ready   control-plane\n"
+            "master-0-1   Ready   control-plane\n"
+            "master-0-2   Ready,SchedulingDisabled   control-plane\n")
+        etcd = [
+            {"started": True, "leader": False},
+            {"started": True, "leader": True},
+            {"started": True, "leader": False},
+        ]
+        good = [{"name": "authentication", "available": "True", "progressing": "False", "degraded": "False"}]
+        self.assertFalse(ct.compact_health(nodes, etcd, good)["ok"])
+        nodes[2]["ready"] = True
+        bad = good + [{"name": "machine-config", "available": "True", "progressing": "False", "degraded": "True"}]
+        health = ct.compact_health(nodes, etcd, bad)
+        self.assertFalse(health["ok"])
+        self.assertEqual(health["unhealthy_operators"], ["machine-config"])
+        self.assertTrue(ct.compact_health(nodes, etcd, good)["ok"])
+        self.assertEqual(
+            ct.compact_node_address_patch("192.168.204.81")["status"]["addresses"][0]["address"],
+            "192.168.204.81")
+        machine = json.dumps({"status": {"addresses": [{"type": "InternalIP", "address": "192.168.123.65"}]}})
+        patched = json.loads(ct.compact_status_address_patch(machine, [("192.168.123.65", "192.168.204.81")]))
+        self.assertEqual(patched["status"]["addresses"][0]["address"], "192.168.204.81")
+        host = json.dumps({"status": {"hardware": {"nics": [{"ip": "192.168.123.65", "name": "ens3"}]}}})
+        hardware = json.loads(ct.compact_bmh_hardware_patch(host, [("192.168.123.65", "192.168.204.81")]))
+        self.assertEqual(hardware[0]["value"]["nics"][0]["ip"], "192.168.204.81")
+        self.assertEqual(ct.compact_webhook_failure_patch("Ignore")[0]["value"], "Ignore")
+        wide = ct.parse_oc_nodes(
+            "master-0-0 Ready control-plane,master,worker 5h v1.35.8 192.168.204.69 <none>\n"
+            "master-0-1 Ready control-plane,master,worker 5h v1.35.8 192.168.204.81 <none>\n"
+            "master-0-2 Ready control-plane,master,worker 5h v1.35.8 192.168.123.50 <none>\n")
+        self.assertFalse(ct.compact_node_ips_ready(wide, [
+            {"role": "master-0-0", "ip": "192.168.204.69"},
+            {"role": "master-0-1", "ip": "192.168.204.81"},
+            {"role": "master-0-2", "ip": "192.168.204.89"},
+        ]))
+        wide[2]["ip"] = "192.168.204.89"
+        self.assertTrue(ct.compact_node_ips_ready(wide, [
+            {"role": "master-0-0", "ip": "192.168.204.69"},
+            {"role": "master-0-1", "ip": "192.168.204.81"},
+            {"role": "master-0-2", "ip": "192.168.204.89"},
+        ]))
+        secret = json.dumps({"data": {
+            "etcd-peer-master-0-2.crt": "b2xk",
+            "etcd-peer-master-0-2.key": "a2V5",
+            "untouched": "eWVz",
+        }})
+        patched = json.loads(ct.compact_etcd_secret_patch(secret, {
+            "etcd-peer-master-0-2.crt": "new-cert",
+            "missing.crt": "nope",
+        }))
+        self.assertEqual(base64.b64decode(patched["data"]["etcd-peer-master-0-2.crt"]).decode(), "new-cert")
+        self.assertNotIn("etcd-peer-master-0-2.key", patched["data"])
+        self.assertNotIn("missing.crt", patched["data"])
+        unchanged = json.loads(ct.compact_etcd_secret_patch(secret, {
+            "etcd-peer-master-0-2.crt": "old",
+        }))
+        self.assertEqual(unchanged["data"], {})
+        self.assertIn("etcd-peer-master-0-2", ct.compact_etcd_cert_names([
+            {"role": "master-0-2"},
+        ]))
+        self.assertIn("find /etc/kubernetes/static-pod-resources", ct.compact_install_etcd_certs_script())
+        self.assertEqual(ct.compact_readiness_stage(3, True, 2, 2, True, ["etcd"]), "etcd-rollout")
+        self.assertEqual(ct.compact_readiness_stage(3, True, 3, 3, True, ["kube-apiserver"]), "core")
+        self.assertEqual(ct.compact_readiness_stage(3, True, 3, 3, True, []), "core-ready")
+        core, post = ct.compact_split_operators(["etcd", "console", "insights"])
+        self.assertEqual(core, ["etcd"])
+        self.assertEqual(post, ["console"])
+        self.assertEqual(ct.parse_etcd_pods(
+            "etcd-master-0-0 5/5 Running 0 1m\n"
+            "etcd-master-0-1 0/5 Pending 0 1m\n"
+            "etcd-guard-master-0-0 1/1 Running 0 1m\n"), 1)
+
+    def test_compact_master_lease_cleanup_keeps_clone_ips_only(self):
+        node_ips = [
+            "192.168.220.69",
+            "192.168.220.81",
+            "192.168.220.89",
+        ]
+        lease_keys = "\n".join([
+            "/kubernetes.io/masterleases/192.168.123.50",
+            "/kubernetes.io/masterleases/192.168.220.89",
+            "/kubernetes.io/masterleases/192.168.220.69",
+            "/kubernetes.io/masterleases/192.168.123.64",
+            "/kubernetes.io/masterleases/192.168.220.81",
+        ])
+
+        self.assertEqual(ct.compact_stale_master_lease_keys(lease_keys, node_ips), [
+            "/kubernetes.io/masterleases/192.168.123.50",
+            "/kubernetes.io/masterleases/192.168.123.64",
+        ])
+        self.assertEqual(ct.compact_stale_master_lease_keys("", node_ips), [])
+
+    def test_compact_master_lease_cleanup_rejects_malformed_lease_keys(self):
+        with self.assertRaises(ValueError):
+            ct.compact_stale_master_lease_keys(
+                "/kubernetes.io/masterleases/not-an-ip", ["192.168.220.69"])
+
+    def test_compact_master_lease_etcd_command_uses_clone_quorum(self):
+        nodes = [
+            {"role": "master-0-0", "ip": "192.168.220.69"},
+            {"role": "master-0-1", "ip": "192.168.220.81"},
+            {"role": "master-0-2", "ip": "192.168.220.89"},
+        ]
+        command = ct.compact_master_lease_etcd_command(
+            "quay.io/openshift/etcd:latest", nodes, "delete",
+            "/kubernetes.io/masterleases/192.168.123.50")
+        self.assertIn("https://192.168.220.69:2379", command)
+        self.assertIn("https://192.168.220.81:2379", command)
+        self.assertIn("https://192.168.220.89:2379", command)
+        self.assertIn("--entrypoint etcdctl", command)
+        self.assertIn("etcd-peer-master-0-1.crt", command)
+        self.assertIn("del /kubernetes.io/masterleases/192.168.123.50", command)
+        with self.assertRaises(ValueError):
+            ct.compact_master_lease_etcd_command(
+                "quay.io/openshift/etcd:latest", nodes, "delete", "not-a-lease-key")
+
+    def test_compact_mco_lease_expiry_requires_a_valid_expired_lease(self):
+        now = ct.datetime.fromisoformat("2026-10-24T04:10:00+00:00")
+        expired = {
+            "spec": {
+                "holderIdentity": "source-controller",
+                "renewTime": "2026-10-24T04:00:00Z",
+                "leaseDurationSeconds": 137,
+            }
+        }
+        recent = {
+            "spec": {
+                "holderIdentity": "active-controller",
+                "renewTime": "2026-10-24T04:08:00Z",
+                "leaseDurationSeconds": 137,
+            }
+        }
+
+        self.assertTrue(ct.compact_lease_is_expired(expired, now))
+        self.assertFalse(ct.compact_lease_is_expired(recent, now))
+        self.assertFalse(ct.compact_lease_is_expired({"spec": {}}, now))
+        self.assertFalse(ct.compact_lease_is_expired("not-json", now))
+        self.assertEqual(
+            ct.COMPACT_MCO_CONTROLLER_LEASE,
+            ("openshift-machine-config-operator", "machine-config-controller"))
+
+    def test_compact_lease_delete_preconditions_require_uid_and_resource_version(self):
+        lease = {"metadata": {"uid": "lease-uid", "resourceVersion": "17"}}
+        self.assertEqual(ct.compact_lease_delete_preconditions(lease), {
+            "uid": "lease-uid", "resourceVersion": "17",
+        })
+        self.assertIsNone(ct.compact_lease_delete_preconditions({"metadata": {"uid": "lease-uid"}}))
+        self.assertIsNone(ct.compact_lease_delete_preconditions("not-json"))
+
+    def test_conditional_delete_script_sends_uid_and_resource_version_to_api(self):
+        script = ct.compact_kubernetes_delete_proxy_script(
+            "KUBECONFIG=/tmp/clone.kubeconfig oc --server=https://192.168.220.5:6443",
+            "/apis/coordination.k8s.io/v1/namespaces/openshift-machine-config-operator/leases/machine-config-controller",
+            {"uid": "lease-uid", "resourceVersion": "17"},
+        )
+        self.assertIn("proxy --address=127.0.0.1 --port=0", script)
+        self.assertIn("--request DELETE", script)
+        self.assertIn(
+            "--data-binary '{\"apiVersion\":\"v1\",\"kind\":\"DeleteOptions\","
+            "\"preconditions\":{\"uid\":\"lease-uid\",\"resourceVersion\":\"17\"}}'",
+            script,
+        )
+        with self.assertRaises(ValueError):
+            ct.compact_kubernetes_delete_proxy_script(
+                "oc", "/apis/apps/v1/namespaces/ns/deployments/name",
+                {"uid": "lease-uid"})
+
+    def test_compact_mco_lease_cleanup_deletes_only_expired_leases(self):
+        old_renew_time = (
+            ct.datetime.now(ct.timezone.utc) - ct.timedelta(days=1)).isoformat()
+        expired = json.dumps({
+            "metadata": {"uid": "lease-uid", "resourceVersion": "17"},
+            "spec": {
+                "holderIdentity": "source-controller",
+                "renewTime": old_renew_time,
+                "leaseDurationSeconds": 137,
+            }
+        })
+        get_after_delete = MagicMock(
+            returncode=1, stdout="", stderr="Error from server (NotFound): leases not found")
+        responses = [
+            MagicMock(returncode=0, stdout=expired, stderr=""),
+            MagicMock(returncode=0, stdout="", stderr=""),
+            get_after_delete,
+        ]
+        mock_env = MagicMock()
+        mock_env.run.side_effect = responses
+        with patch.object(ct, "env", mock_env), \
+                patch.object(ct, "_clone_log") as clone_log:
+            ct._clear_expired_mco_controller_lease("oc --kubeconfig=clone.kubeconfig", "/work")
+
+        self.assertEqual(mock_env.run.call_count, 3)
+        delete_command = mock_env.run.call_args_list[1].args[0]
+        self.assertIn("/leases/machine-config-controller", delete_command)
+        self.assertIn('"preconditions":{"uid":"lease-uid","resourceVersion":"17"}',
+                      delete_command)
+        self.assertIn("--request DELETE", delete_command)
+        self.assertIn("verified removal", clone_log.call_args.args[1])
+
+    def test_expired_mco_lease_cleanup_preserves_lease_renewed_after_conflict(self):
+        old_renew_time = (
+            ct.datetime.now(ct.timezone.utc) - ct.timedelta(days=1)).isoformat()
+        renewed_time = ct.datetime.now(ct.timezone.utc).isoformat()
+        expired = json.dumps({
+            "metadata": {"uid": "lease-uid", "resourceVersion": "17"},
+            "spec": {
+                "holderIdentity": "old-holder",
+                "renewTime": old_renew_time,
+                "leaseDurationSeconds": 137,
+            },
+        })
+        renewed = json.dumps({
+            "metadata": {"uid": "lease-uid", "resourceVersion": "18"},
+            "spec": {
+                "holderIdentity": "active-holder",
+                "renewTime": renewed_time,
+                "leaseDurationSeconds": 137,
+            },
+        })
+        mock_env = MagicMock()
+        mock_env.run.side_effect = [
+            MagicMock(returncode=0, stdout=expired, stderr=""),
+            MagicMock(returncode=1, stdout="", stderr="Error from server (Conflict)"),
+            MagicMock(returncode=0, stdout=renewed, stderr=""),
+        ]
+        with patch.object(ct, "env", mock_env), patch.object(ct, "_clone_log") as clone_log:
+            ct._clear_expired_mco_controller_lease("oc", "/work")
+
+        self.assertEqual(mock_env.run.call_count, 3)
+        self.assertIn('"preconditions":{"uid":"lease-uid","resourceVersion":"17"}',
+                      mock_env.run.call_args_list[1].args[0])
+        self.assertIn("renewed during cleanup", clone_log.call_args.args[1])
+
+    def test_expired_mco_lease_cleanup_preserves_replacement_after_conflict(self):
+        old_renew_time = (
+            ct.datetime.now(ct.timezone.utc) - ct.timedelta(days=1)).isoformat()
+        expired = json.dumps({
+            "metadata": {"uid": "old-uid", "resourceVersion": "17"},
+            "spec": {
+                "holderIdentity": "old-holder",
+                "renewTime": old_renew_time,
+                "leaseDurationSeconds": 137,
+            },
+        })
+        replaced = json.dumps({
+            "metadata": {"uid": "new-uid", "resourceVersion": "1"},
+            "spec": {
+                "holderIdentity": "new-holder",
+                "renewTime": old_renew_time,
+                "leaseDurationSeconds": 137,
+            },
+        })
+        mock_env = MagicMock()
+        mock_env.run.side_effect = [
+            MagicMock(returncode=0, stdout=expired, stderr=""),
+            MagicMock(returncode=1, stdout="", stderr="Error from server (Conflict)"),
+            MagicMock(returncode=0, stdout=replaced, stderr=""),
+        ]
+        with patch.object(ct, "env", mock_env), patch.object(ct, "_clone_log") as clone_log:
+            ct._clear_expired_mco_controller_lease("oc", "/work")
+
+        self.assertEqual(mock_env.run.call_count, 3)
+        self.assertIn("preserving replacement", clone_log.call_args.args[1])
+
+    def test_compact_finish_clears_expired_mco_lease_before_mco_render(self):
+        source = inspect.getsource(ct._finish_compact_clone)
+        clear_lease = source.index("_clear_expired_mco_controller_lease(clone_oc, work)")
+        prepare_render = source.index("_wait_compact_machineconfig_source(clone_oc")
+        self.assertLess(clear_lease, prepare_render)
+
+    def test_etcd_bundle_update_is_ordered_and_fail_closed(self):
+        source = inspect.getsource(ct._finish_compact_clone)
+        sign = source.index("sign kubelet certificates with the live CSR signer")
+        rewrite = source.index("rewrite cluster records and 00-master")
+        health = source.index("wait until etcd and the API revisions are installed for vmaas")
+        requires = []
+        start = 0
+        while True:
+            found = source.find("_require_reissued_etcd_certs(", start)
+            if found < 0:
+                break
+            requires.append(found)
+            start = found + 1
+        self.assertEqual(requires, sorted(requires))
+        self.assertEqual(len(requires), 2)
+        self.assertLess(requires[0], sign)
+        self.assertLess(sign, rewrite)
+        self.assertLess(requires[1], rewrite)
+        self.assertLess(rewrite, health)
+        self.assertNotIn("_sync_reissued_etcd_certs(", source)
+        self.assertNotIn("copy_to_nodes=True", source)
+        self.assertNotIn("over the operator revision", source)
+        self.assertEqual(source.count("sudo systemctl restart kubelet"), 1)
+        self.assertIn(
+            "master-0-0 kubelet after installing its clone client certificate", source)
+        self.assertNotIn("systemctl restart crio", source)
+        self.assertIn("publish clone node IPs without restarting kubelet", source)
+        self.assertNotIn("is core-ready", source)
+        require_source = inspect.getsource(ct._require_reissued_etcd_certs)
+        self.assertLess(
+            require_source.index("etcd certificate inputs"),
+            require_source.index("_trigger_etcd_member_rollout"))
+        self.assertEqual(
+            ct.compact_etcd_force_redeploy_patch("reissued-etcd-certs"),
+            {"spec": {"forceRedeploymentReason": "reissued-etcd-certs"}})
+
+        nodes = [{"role": "master-0-0", "ip": "192.168.210.69"}]
+        pems = {
+            f"{name}.{ext}": f"{name}-{ext}\n"
+            for name in ct.compact_etcd_cert_names(nodes)
+            for ext in ("crt", "key")
+        }
+
+        class _Cmd:
+            def __init__(self, returncode=0, stdout="", stderr=""):
+                self.returncode = returncode
+                self.stdout = stdout
+                self.stderr = stderr
+
+        class _Env:
+            def __init__(self, handler):
+                self.calls = []
+                self.handler = handler
+
+            def run(self, cmd, check=True):
+                self.calls.append(cmd)
+                return self.handler(cmd)
+
+        def bundle(values):
+            return json.dumps({"data": {
+                key: base64.b64encode(value.encode()).decode() for key, value in values.items()
+            }})
+
+        def patches(calls):
+            return [cmd for cmd in calls if "patch secret " in cmd]
+
+        previous = ct.env
+        try:
+            with tempfile.TemporaryDirectory() as work:
+                root = Path(work) / "etcd-new"
+                root.mkdir()
+                for key, value in pems.items():
+                    (root / key).write_text(value)
+                def current_handler(cmd):
+                    if "get secret etcd-all-certs" in cmd:
+                        return _Cmd(0, bundle(pems))
+                    for name in ct.compact_etcd_cert_names(nodes):
+                        if f"get secret {name} " in cmd:
+                            return _Cmd(0, bundle({
+                                "tls.crt": pems[f"{name}.crt"],
+                                "tls.key": pems[f"{name}.key"],
+                            }))
+                    return _Cmd()
+
+                current = _Env(current_handler)
+                ct.env = current
+                result = ct._sync_reissued_etcd_certs("oc", nodes, "/id", work, False)
+                self.assertEqual(result["bundle"], "already-current")
+                self.assertEqual(result["members_current"], [
+                    "etcd-peer-master-0-0",
+                    "etcd-serving-master-0-0",
+                    "etcd-serving-metrics-master-0-0",
+                ])
+                self.assertEqual(patches(current.calls), [])
+
+                old = {key: "old\n" for key in pems}
+                reads = {"n": 0}
+
+                def changed(cmd):
+                    if "get secret etcd-all-certs" in cmd:
+                        reads["n"] += 1
+                        return _Cmd(0, bundle(pems if reads["n"] > 1 else old))
+                    if "get secret etcd-" in cmd:
+                        return _Cmd(1, "", "Error from server (NotFound): secret not found")
+                    return _Cmd()
+
+                updated = _Env(changed)
+                ct.env = updated
+                result = ct._sync_reissued_etcd_certs("oc", nodes, "/id", work, False)
+                self.assertEqual(result["bundle"], "patched")
+                self.assertEqual(result["members_missing"], [
+                    "etcd-peer-master-0-0",
+                    "etcd-serving-master-0-0",
+                    "etcd-serving-metrics-master-0-0",
+                ])
+                self.assertEqual(len(patches(updated.calls)), 1)
+                self.assertTrue(any("etcd-all-certs patch requested" in cmd for cmd in updated.calls))
+                self.assertTrue(any("etcd-all-certs patch verified" in cmd for cmd in updated.calls))
+
+                def rejected(cmd):
+                    if "get secret etcd-all-certs" in cmd:
+                        return _Cmd(1, "", "connection refused")
+                    if "oc config view" in cmd:
+                        return _Cmd(0, "test-cluster\n")
+                    if "oc config set-cluster" in cmd:
+                        return _Cmd()
+                    if "echo yes" in cmd:
+                        return _Cmd(0, "yes\n")
+                    return _Cmd()
+
+                failed = _Env(rejected)
+                ct.env = failed
+                with patch.object(ct, "_clear_compact_stale_master_leases"), \
+                        patch.object(
+                            ct,
+                            "_load_revision_baseline",
+                            side_effect=lambda _work, operator=None: (
+                                10 if operator == "kube-apiserver" else None
+                            ),
+                        ), \
+                        self.assertRaises(SystemExit) as aborted:
+                    ct._finish_compact_clone(
+                        {}, "edge10", nodes, "/id", work, "/crypto", "etcd", "cn",
+                        "/plan", {}, "192.168.210.81", "/src", [], start_at="rewrite")
+                self.assertIn("reading etcd-all-certs failed", str(aborted.exception))
+                self.assertFalse(any("rewrite cluster records" in cmd for cmd in failed.calls))
+                self.assertFalse(any("wait until etcd and the API revisions" in cmd for cmd in failed.calls))
+                self.assertEqual(patches(failed.calls), [])
+
+                def patch_fails(cmd):
+                    if "get secret etcd-all-certs" in cmd:
+                        return _Cmd(0, bundle(old))
+                    if "patch secret etcd-all-certs" in cmd:
+                        return _Cmd(1, "", "denied")
+                    return _Cmd()
+
+                denied = _Env(patch_fails)
+                ct.env = denied
+                with self.assertRaises(SystemExit) as aborted:
+                    ct._require_reissued_etcd_certs("oc", nodes, "/id", work)
+                self.assertIn("patching etcd-all-certs failed", str(aborted.exception))
+                self.assertFalse(any("patch verified" in cmd for cmd in denied.calls))
+                self.assertFalse(any("patch etcd cluster" in cmd for cmd in denied.calls))
+                self.assertFalse(any("wait until etcd and the API revisions" in cmd for cmd in denied.calls))
+
+                triggered_reads = {"n": 0}
+
+                def trigger_handler(cmd):
+                    if "get secret etcd-all-certs" in cmd:
+                        triggered_reads["n"] += 1
+                        return _Cmd(0, bundle(pems if triggered_reads["n"] > 1 else old))
+                    if "get secret etcd-" in cmd:
+                        return _Cmd(1, "", "Error from server (NotFound): secret not found")
+                    if "patch etcd cluster" in cmd:
+                        self.assertIn("forceRedeploymentReason", cmd)
+                        return _Cmd()
+                    if "get co etcd -o json" in cmd:
+                        return _Cmd(0, json.dumps({"status": {"conditions": [{
+                            "type": "Progressing",
+                            "status": "False",
+                            "message": "NodeInstallerProgressing: 3 nodes are at revision 10",
+                        }]}}))
+                    return _Cmd()
+
+                triggered = _Env(trigger_handler)
+                ct.env = triggered
+                result = ct._require_reissued_etcd_certs("oc", nodes, "/id", work)
+                self.assertEqual(result["bundle"], "patched")
+                trigger_at = next(i for i, cmd in enumerate(triggered.calls) if "patch etcd cluster" in cmd)
+                verified_at = next(i for i, cmd in enumerate(triggered.calls) if "etcd-all-certs patch verified" in cmd)
+                self.assertLess(verified_at, trigger_at)
+
+                current_again = _Env(current_handler)
+                ct.env = current_again
+                result = ct._require_reissued_etcd_certs("oc", nodes, "/id", work)
+                self.assertEqual(result["bundle"], "already-current")
+                self.assertFalse(any("patch etcd cluster" in cmd for cmd in current_again.calls))
+
+                reReads = {"n": 0}
+
+                def trigger_rejected_fixed(cmd):
+                    if "get secret etcd-all-certs" in cmd:
+                        reReads["n"] += 1
+                        return _Cmd(0, bundle(pems if reReads["n"] > 1 else old))
+                    if "patch secret etcd-all-certs" in cmd:
+                        return _Cmd()
+                    if "patch etcd cluster" in cmd:
+                        return _Cmd(1, "", "denied")
+                    if "get co etcd -o json" in cmd:
+                        return _Cmd(0, json.dumps({"status": {"conditions": [{
+                            "type": "Progressing",
+                            "status": "False",
+                            "message": "NodeInstallerProgressing: 3 nodes are at revision 10",
+                        }]}}))
+                    if "get secret etcd-" in cmd:
+                        return _Cmd(1, "", "Error from server (NotFound): secret not found")
+                    return _Cmd()
+
+                rejected_trigger = _Env(trigger_rejected_fixed)
+                ct.env = rejected_trigger
+                with self.assertRaises(SystemExit) as aborted:
+                    ct._require_reissued_etcd_certs("oc", nodes, "/id", work)
+                self.assertIn("etcd rollout trigger failed", str(aborted.exception))
+                self.assertFalse(any("etcd rollout triggered" in cmd for cmd in rejected_trigger.calls))
+        finally:
+            ct.env = previous
+
+    def test_core_ready_resets_when_a_core_condition_regresses(self):
+        for name in ct.CORE_OPERATORS:
+            stage = ct.compact_readiness_stage(3, True, 3, 3, True, [name])
+            self.assertNotEqual(stage, "core-ready", name)
+        core, post = ct.compact_split_operators(["machine-config", "insights"])
+        self.assertEqual(core, [])
+        self.assertEqual(post, ["machine-config"])
+        self.assertEqual(ct.compact_readiness_stage(3, True, 3, 3, True, core), "core-ready")
+        self.assertEqual(ct.compact_next_stable_samples(1, "core-ready", True, True), 2)
+        self.assertEqual(ct.compact_next_stable_samples(1, "etcd-rollout", True, True), 0)
+        self.assertEqual(ct.compact_next_stable_samples(1, "core", True, True), 0)
+        self.assertEqual(ct.compact_next_stable_samples(1, "core-ready", False, True), 0)
+        self.assertEqual(ct.compact_next_stable_samples(1, "core-ready", True, False), 0)
+        self.assertEqual(ct.compact_next_stable_samples(1, "core-ready", True, True, False), 0)
+        self.assertEqual(ct.compact_install_blockers(["ingress", "insights", "console"]), ["ingress"])
+        quiet = {
+            "status": {
+                "latestAvailableRevision": 12,
+                "nodeStatuses": [
+                    {"currentRevision": 12, "targetRevision": 12},
+                    {"currentRevision": 12, "targetRevision": 12},
+                    {"currentRevision": 12, "targetRevision": 12},
+                ],
+            },
+        }
+        pending = {
+            "status": {
+                "latestAvailableRevision": 12,
+                "nodeStatuses": [
+                    {"currentRevision": 10, "targetRevision": 12},
+                    {"currentRevision": 12, "targetRevision": 12},
+                    {"currentRevision": 12, "targetRevision": 12},
+                ],
+            },
+        }
+        self.assertTrue(ct.compact_static_pod_rollout_ready(ct.compact_static_pod_revision(quiet), 10))
+        self.assertFalse(ct.compact_static_pod_rollout_ready(ct.compact_static_pod_revision(quiet), None))
+        self.assertFalse(ct.compact_static_pod_rollout_ready(ct.compact_static_pod_revision(quiet), 12))
+        self.assertFalse(ct.compact_static_pod_rollout_ready(ct.compact_static_pod_revision(pending), 10))
+        settled = {"status": {"conditions": [
+            {"type": "Progressing", "status": "False",
+             "message": "NodeInstallerProgressing: 3 nodes are at revision 13"},
+            {"type": "Available", "status": "True",
+             "message": "StaticPodsAvailable: 3 nodes are active; 3 nodes are at revision 13"},
+        ]}}
+        rolling = {"status": {"conditions": [
+            {"type": "Progressing", "status": "True",
+             "message": "NodeInstallerProgressing: 3 nodes are at revision 10; 0 nodes have achieved new revision 12"},
+        ]}}
+        split = {"status": {"conditions": [
+            {"type": "Progressing", "status": "True",
+             "message": "NodeInstallerProgressing: 2 nodes are at revision 5; 1 node is at revision 8"},
+        ]}}
+        self.assertEqual(ct.compact_static_pod_revision(settled)["current"], 13)
+        self.assertTrue(ct.compact_static_pod_rollout_ready(ct.compact_static_pod_revision(settled), 10))
+        self.assertFalse(ct.compact_static_pod_rollout_ready(ct.compact_static_pod_revision(settled), 13))
+        self.assertEqual(ct.compact_static_pod_revision(rolling)["current"], 10)
+        self.assertEqual(ct.compact_static_pod_revision(rolling)["latest"], 12)
+        self.assertFalse(ct.compact_static_pod_revision(rolling)["converged"])
+        self.assertFalse(ct.compact_static_pod_revision(split)["converged"])
+        self.assertEqual(ct.compact_static_pod_revision(split)["latest"], 8)
+
+    def test_edge13_revision_messages_need_exactly_three_nodes(self):
+        quiet = (
+            "NodeInstallerProgressing: 3 nodes are at revision 13\n"
+            "StaticPodsAvailable: 3 nodes are active; 3 nodes are at revision 13"
+        )
+        rolling = (
+            "NodeInstallerProgressing: 3 nodes are at revision 9; "
+            "0 nodes have achieved new revision 10\n"
+            "StaticPodsAvailable: 3 nodes are active; 3 nodes are at revision 9; "
+            "0 nodes have achieved new revision 10"
+        )
+        singular = "NodeInstallerProgressing: 1 node is at revision 5; 2 nodes are at revision 8"
+        contradictory = "NodeInstallerProgressing: 3 nodes are at revision 10; 1 node is at revision 12"
+        short = "NodeInstallerProgressing: 2 nodes are at revision 10; 2 nodes are at revision 11"
+        malformed = "NodeInstallerProgressing: all nodes are current"
+        self.assertEqual(ct.compact_revision_from_text(quiet), {
+            "latest": 13, "current": 13, "converged": True,
+        })
+        self.assertEqual(ct.compact_revision_from_text(rolling), {
+            "latest": 10, "current": 9, "converged": False,
+        })
+        self.assertFalse(ct.compact_revision_from_text(singular)["converged"])
+        self.assertEqual(ct.compact_revision_from_text(singular)["latest"], 8)
+        self.assertIsNone(ct.compact_revision_from_text(singular)["current"])
+        self.assertFalse(ct.compact_revision_from_text(contradictory)["converged"])
+        self.assertIsNone(ct.compact_revision_from_text(contradictory)["current"])
+        self.assertFalse(ct.compact_revision_from_text(short)["converged"])
+        self.assertEqual(ct.compact_revision_from_text(short)["latest"], 11)
+        self.assertEqual(ct.compact_revision_from_text(malformed), {
+            "latest": None, "current": None, "converged": False,
+        })
+        self.assertEqual(ct.compact_revision_from_text(""), {
+            "latest": None, "current": None, "converged": False,
+        })
+        duplicated = {"status": {"conditions": [
+            {"type": "Progressing", "status": "False",
+             "message": "NodeInstallerProgressing: 3 nodes are at revision 13"},
+            {"type": "Available", "status": "True",
+             "message": "StaticPodsAvailable: 3 nodes are active; 3 nodes are at revision 13"},
+        ]}}
+        self.assertTrue(ct.compact_static_pod_revision(duplicated)["converged"])
+        self.assertEqual(ct.compact_static_pod_revision(duplicated)["latest"], 13)
+        split_message = (
+            "NodeInstallerProgressing: 1 node is at revision 10; 2 nodes are at revision 12"
+        )
+        self.assertFalse(ct.compact_revision_from_text(split_message)["converged"])
+        self.assertEqual(ct.compact_revision_from_text(
+            "NodeInstallerProgressing: 2 nodes are at revision 5; 1 node is at revision 8"
+        )["latest"], 8)
+        self.assertEqual(ct.compact_revision_from_text(
+            "NodeInstallerProgressing: 3 nodes are at revision 10; 0 nodes have achieved new revision 12"
+        ), {"latest": 12, "current": 10, "converged": False})
+        quiet_docs = {
+            "etcd": {"status": {"conditions": [
+                {"type": "Available", "status": "True"},
+                {"type": "Progressing", "status": "False"},
+                {"type": "Degraded", "status": "False"},
+            ]}},
+            "ingress": {"status": {"conditions": [
+                {"type": "Available", "status": "True"},
+                {"type": "Progressing", "status": "True"},
+                {"type": "Degraded", "status": "False"},
+            ]}},
+        }
+        observed = {op["name"]: op for op in ct.compact_operators_from_docs(quiet_docs)}
+        self.assertEqual(observed["etcd"]["progressing"], "False")
+        self.assertEqual(observed["ingress"]["progressing"], "True")
+        self.assertFalse(ct.compact_install_observation_ready(3, True, [], ["ingress"], True))
+        self.assertFalse(ct.compact_install_observation_ready(3, True, [], [], False))
+        self.assertTrue(ct.compact_install_observation_ready(3, True, [], [], True))
+        self.assertFalse(ct.compact_install_observation_ready(
+            3, True, [], [], True, endpoints_ready=False))
+        finish = inspect.getsource(ct._finish_compact_clone)
+        self.assertIn('"render": resolve_master_render', finish)
+        self.assertIn(
+            '"api-certificates": lambda: _recover_compact_api_certificates_and_endpoints(',
+            finish,
+        )
+        recovery = inspect.getsource(ct._recover_compact_api_certificates)
+        self.assertLess(recovery.index("_ensure_api_certificates"), recovery.index("_refresh_internal_api_certificate"))
+        self.assertNotIn("time.sleep(30)", finish)
+
+    def test_kube_apiserver_install_readiness_uses_each_advanced_node(self):
+        rolling_but_available = {"status": {"conditions": [
+            {"type": "Progressing", "status": "True",
+             "message": "NodeInstallerProgressing: 1 node is at revision 8; 2 nodes are at revision 9"},
+            {"type": "Available", "status": "True",
+             "message": "StaticPodsAvailable: 3 nodes are active; 1 node is at revision 8; 2 nodes are at revision 9"},
+            {"type": "Degraded", "status": "False"},
+        ]}}
+        self.assertTrue(ct.compact_static_pod_nodes_newer_than(rolling_but_available, 5))
+        self.assertTrue(ct.compact_kube_apiserver_nodes_ready_for_install(rolling_but_available, 5))
+        self.assertFalse(ct.compact_kube_apiserver_nodes_ready_for_install(rolling_but_available, 8))
+
+        status_report = {"status": {
+            "nodeStatuses": [
+                {"nodeName": "master-0-0", "currentRevision": 8, "targetRevision": 9},
+                {"nodeName": "master-0-1", "currentRevision": 9, "targetRevision": 0},
+                {"nodeName": "master-0-2", "currentRevision": 9, "targetRevision": 0},
+            ],
+            "conditions": [
+                {"type": "Available", "status": "True"},
+                {"type": "Degraded", "status": "False"},
+            ],
+        }}
+        self.assertTrue(ct.compact_kube_apiserver_nodes_ready_for_install(status_report, 5))
+
+        wrong_nodes = {"status": {
+            "nodeStatuses": [
+                {"nodeName": "source-master-0-0", "currentRevision": 9},
+                {"nodeName": "source-master-0-1", "currentRevision": 9},
+                {"nodeName": "source-master-0-2", "currentRevision": 9},
+            ],
+            "conditions": [
+                {"type": "Available", "status": "True"},
+                {"type": "Degraded", "status": "False"},
+            ],
+        }}
+        self.assertFalse(ct.compact_kube_apiserver_nodes_ready_for_install(wrong_nodes, 5))
+
+        one_node_still_on_baseline = {"status": {"conditions": [
+            {"type": "Progressing", "status": "True",
+             "message": "NodeInstallerProgressing: 1 node is at revision 5; 1 node is at revision 8; 1 node is at revision 9"},
+            {"type": "Available", "status": "True"},
+            {"type": "Degraded", "status": "False"},
+        ]}}
+        self.assertFalse(ct.compact_static_pod_nodes_newer_than(one_node_still_on_baseline, 5))
+        self.assertFalse(ct.compact_kube_apiserver_nodes_ready_for_install(one_node_still_on_baseline, 5))
+
+        unavailable = {"status": {"conditions": [
+            {"type": "Progressing", "status": "True",
+             "message": "NodeInstallerProgressing: 1 node is at revision 8; 2 nodes are at revision 9"},
+            {"type": "Available", "status": "False"},
+            {"type": "Degraded", "status": "False"},
+        ]}}
+        self.assertFalse(ct.compact_kube_apiserver_nodes_ready_for_install(unavailable, 5))
+
+        degraded = {"status": {"conditions": [
+            {"type": "Progressing", "status": "True",
+             "message": "NodeInstallerProgressing: 1 node is at revision 8; 2 nodes are at revision 9"},
+            {"type": "Available", "status": "True"},
+            {"type": "Degraded", "status": "True"},
+        ]}}
+        self.assertFalse(ct.compact_kube_apiserver_nodes_ready_for_install(degraded, 5))
+
+    def test_health_resume_requires_saved_revision_baselines(self):
+        self.assertIsNone(ct.compact_valid_revision_baselines(None))
+        self.assertIsNone(ct.compact_valid_revision_baselines({"etcd": 10}))
+        self.assertIsNone(ct.compact_valid_revision_baselines({"etcd": 10, "kube-apiserver": None}))
+        self.assertIsNone(ct.compact_valid_revision_baselines({"etcd": True, "kube-apiserver": 5}))
+        self.assertEqual(
+            ct.compact_valid_revision_baselines({"etcd": 10, "kube-apiserver": 5}),
+            (10, 5))
+
+        class _Cmd:
+            def __init__(self, stdout=""):
+                self.returncode = 0
+                self.stdout = stdout
+                self.stderr = ""
+
+        class _Env:
+            def __init__(self, stdout=""):
+                self.calls = []
+                self.stdout = stdout
+
+            def run(self, cmd, check=True):
+                self.calls.append(cmd)
+                return _Cmd(self.stdout)
+
+        previous = ct.env
+        try:
+            missing = _Env("")
+            ct.env = missing
+            self.assertIsNone(ct._load_revision_baselines("/work"))
+            with patch.object(ct, "_clear_compact_stale_master_leases"), \
+                    self.assertRaises(SystemExit) as aborted:
+                nodes = [
+                    {"role": role, "ip": ip}
+                    for role, ip in zip(
+                        ct.COMPACT_ROLES,
+                        ("192.168.214.69", "192.168.214.81", "192.168.214.89"),
+                    )
+                ]
+                ct._finish_compact_clone(
+                    {}, "edge14", nodes, "/id", "/work", "/crypto", "etcd", "cn",
+                    "/plan", {}, "192.168.214.81", "/src", [], start_at="health")
+            self.assertIn("revision baselines", str(aborted.exception))
+            self.assertFalse(any("wait until etcd and the API revisions" in cmd for cmd in missing.calls))
+            saved = _Env(json.dumps({"etcd": 10, "kube-apiserver": 5}))
+            ct.env = saved
+            self.assertEqual(ct._load_revision_baselines("/work"), (10, 5))
+        finally:
+            ct.env = previous
+
+    def test_parallel_failures_are_reported_in_node_order(self):
+        nodes = [
+            {"role": "master-0-2", "ip": "192.168.214.89"},
+            {"role": "master-0-0", "ip": "192.168.214.69"},
+            {"role": "master-0-1", "ip": "192.168.214.81"},
+        ]
+
+        def fail(node):
+            if node["role"] != "master-0-1":
+                sys.exit(f"boom {node['role']}")
+
+        with self.assertRaises(SystemExit) as aborted:
+            ct._in_parallel(nodes, fail)
+        text = str(aborted.exception)
+        self.assertLess(text.index("master-0-2"), text.index("master-0-0"))
+        self.assertNotIn("master-0-1", text)
+        self.assertIn("boom master-0-2", text)
+        self.assertIn("boom master-0-0", text)
+        with self.assertRaises(SystemExit) as aborted:
+            ct._in_parallel([
+                ({"role": "master-0-1"}, "restore"),
+                ({"role": "master-0-0"}, "restore"),
+            ], lambda item: sys.exit("restore failed"))
+        text = str(aborted.exception)
+        self.assertLess(text.index("master-0-1"), text.index("master-0-0"))
+        blocker = ct.compact_core_blocker_text(json.dumps({"items": [{
+            "metadata": {"name": "kube-apiserver"},
+            "status": {"conditions": [
+                {"type": "Progressing", "status": "True", "reason": "NodeInstallerProgressing",
+                 "message": "NodeInstallerProgressing: 1 nodes are at revision 7, 2 nodes are at revision 8"},
+                {"type": "Degraded", "status": "False", "reason": "AsExpected", "message": "ignored"},
+            ]},
+        }]}))
+        self.assertIn("kube-apiserver Progressing NodeInstallerProgressing", blocker)
+        self.assertNotIn("ignored", blocker)
+
+    def test_compact_boot_refuses_before_the_sno_path(self):
+        class _State:
+            def __enter__(self):
+                return {"flavors": {"compact": {"topology": "compact"}}, "clones": {}}
+            def __exit__(self, *args):
+                return False
+        args = argparse.Namespace(flavor="compact", name=None, vcpus=None, memory_kib=None, pull_secret="/tmp/ps.json", no_rollback=False)
+        with patch.object(ct, "locked_state", _State):
+            with self.assertRaises(SystemExit) as ctx:
+                ct.cmd_boot(args)
+        self.assertIn("compact-boot", str(ctx.exception))
+
+    def test_flavor_layout_replaces_source_domain_and_ips(self):
+        flavor = {
+            "source_cluster": "mno-test2",
+            "source_primary_subnet": 124,
+            "memory_kib": 33554432,
+            "vcpus": 16,
+            "etcd_image": "quay.io/example/etcd:tag",
+        }
+        macs = ["52:54:00:a2:b0:aa", "52:54:00:76:07:c5", "52:54:00:ba:f0:e8"]
+        paths = [f"/flavors/mno-3node/disk-{i}.qcow2" for i in range(3)]
+        text = "KUBERNETES_SERVICE_HOST='api-int.test-infra-cluster-mno2.redhat.com'\n"
+        bases = ct.compact_dns_bases_from_text(text)
+        source = ct.compact_source_from_layout(flavor, macs, bases, paths)
+        nodes = ct.compact_node_plan("edge1", 200, macs)
+        pairs = dict(ct.compact_identity_pairs(source, "edge1", nodes))
+        self.assertEqual(pairs["192.168.124.69"], "192.168.200.69")
+        self.assertEqual(pairs["192.168.124.5"], "192.168.200.5")
+        self.assertEqual(
+            pairs["api-int.test-infra-cluster-mno2.redhat.com"],
+            "api-int.test-infra-cluster-edge1.redhat.com")
+        self.assertEqual(source["nodes"][0]["mac"], "52:54:00:a2:b0:aa")
+        self.assertEqual(source["nodes"][0]["disks"][0]["path"], paths[0])
+        manifest = (
+            '{"name":"NODE_master_0_0_IP","value":"192.168.123.64"},'
+            '{"name":"NODE_master_0_1_IP","value":"192.168.123.65"},'
+            '{"name":"NODE_master_0_2_IP","value":"192.168.123.50"}')
+        member_ips = ct.compact_etcd_member_ips(manifest)
+        self.assertEqual(member_ips, {
+            "master-0-0": "192.168.123.64",
+            "master-0-1": "192.168.123.65",
+            "master-0-2": "192.168.123.50",
+        })
+        assisted = ct.compact_source_from_layout(
+            flavor, macs, bases, paths, node_ips=member_ips)
+        self.assertEqual(assisted["nodes"][0]["ip"], "192.168.123.64")
+        self.assertEqual(assisted["nodes"][1]["ip"], "192.168.123.65")
+        self.assertEqual(assisted["nodes"][2]["ip"], "192.168.123.50")
+        nested = ct.compact_source_from_layout(flavor, macs, bases, [
+            [paths[0], paths[0] + "-spare"], paths[1], paths[2]])
+        self.assertEqual(nested["nodes"][0]["disks"][1]["path"], paths[0] + "-spare")
+        self.assertEqual(len(nested["nodes"][1]["disks"]), 1)
+        with self.assertRaises(SystemExit):
+            ct.compact_flavor_node_disks(["disk-0.qcow2"] * 6)
+
+    def test_nm_mac_and_etcd_secret_pem_extraction(self):
+        self.assertEqual(ct.parse_nm_mac("mac-address=52:54:00:76:07:C5\n"), "52:54:00:76:07:c5")
+        fixture_key = _fixture_pem("TEST FIXTURE KEY", "NOT-A-KEY")
+        fixture_cert = _fixture_pem("CERTIFICATE", "NOT-A-CERT")
+        other_key = _fixture_pem("OTHER TEST FIXTURE KEY", "OTHER")
+        blob = (
+            b"noise /kubernetes.io/secrets/openshift-etcd/etcd-signer "
+            + fixture_cert + b"\n" + fixture_key
+            + b" /kubernetes.io/secrets/openshift-etcd/other "
+            + other_key
+        )
+        found = ct.extract_k8s_secret_pems(blob, "etcd-signer")
+        self.assertEqual(found, [fixture_cert, fixture_key])
+        self.assertEqual(ct.extract_k8s_secret_pems(blob, "missing"), [])
+
+    def test_clone_id_is_a_dns_label(self):
+        self.assertEqual(ct._safe_clone_id("edge1"), "edge1")
+        for bad in ("Edge1", "edge1-", "-edge", "a" * 32, ""):
+            with self.assertRaises(SystemExit) as ctx:
+                ct._safe_clone_id(bad)
+            self.assertIn("lowercase", str(ctx.exception))
+
+    def test_compact_subnet_is_reserved_in_state(self):
+        state = {
+            "flavors": {"mno": {"source_primary_subnet": 124}},
+            "clones": {"edge1": {"subnet_primary": 200, "subnet_secondary": 200, "topology": "compact"}},
+        }
+        self.assertEqual(ct.require_compact_subnet(state, 201), 201)
+        for bad in (0, 255, 124, 200, True):
+            with self.assertRaises(SystemExit):
+                ct.require_compact_subnet(state, bad)
+
+    def test_record_compact_clone_reserves_subnet(self):
+        saved = {}
+
+        class _State:
+            def __enter__(self):
+                return saved.setdefault("state", {"flavors": {}, "clones": {}})
+            def __exit__(self, *args):
+                return False
+
+        with patch.object(ct, "locked_state", _State), \
+             patch.object(ct, "require_compact_libvirt_names_free"):
+            ct.record_compact_clone("edge2", 201, "mno-3node")
+        info = saved["state"]["clones"]["edge2"]
+        self.assertEqual(info["topology"], "compact")
+        self.assertEqual(info["subnet_primary"], 201)
+        with patch.object(ct, "locked_state", _State), \
+             patch.object(ct, "require_compact_libvirt_names_free"):
+            with self.assertRaises(SystemExit):
+                ct.record_compact_clone("edge3", 201, "mno-3node")
+
+    def _kubernetes_endpoint_fixtures(self, ips, ready=True):
+        endpoints = {
+            "metadata": {"managedFields": [{"manager": "kube-controller-manager"}]},
+            "subsets": [{
+                "addresses": [{"ip": ip} for ip in ips],
+                "ports": [{"name": "https", "port": 6443, "protocol": "TCP"}],
+            }],
+        }
+        endpoint_slice = {
+            "metadata": {"managedFields": [{"manager": "kube-controller-manager"}]},
+            "ports": [{"name": "https", "port": 6443, "protocol": "TCP"}],
+            "endpoints": [
+                {"addresses": [ip], "conditions": {"ready": ready}}
+                for ip in ips
+            ],
+        }
+        return json.dumps(endpoints), json.dumps(endpoint_slice)
+
+    def test_machineconfig_retry_reuses_clone_specific_render(self):
+        domain = "test-infra-cluster-edge20.redhat.com"
+        body = f"KUBERNETES_SERVICE_HOST='api-int.{domain}'\nKUBERNETES_SERVICE_PORT='6443'\n"
+        source = "data:;base64," + base64.b64encode(body.encode()).decode()
+        original = json.dumps({"spec": {"config": {"storage": {"files": [{
+            "path": "/etc/kubernetes/apiserver-url.env",
+            "contents": {"source": source},
+        }]}}}})
+        render = json.dumps({
+            "metadata": {"name": "rendered-master-edge20"},
+            "spec": {"config": {"storage": {"files": [{
+                "path": "/etc/kubernetes/apiserver-url.env",
+                "contents": {"source": source},
+            }]}}},
+        })
+
+        result = ct.compact_ensure_machineconfig_render_change(
+            original, original, domain, existing_render_raw=render)
+        self.assertEqual(json.loads(result)["spec"], json.loads(original)["spec"])
+        self.assertEqual(json.loads(result)["spec"]["config"]["storage"]["files"][0]
+                         ["contents"]["source"], source)
+
+    def test_machine_config_observations_capture_per_node_rollout_timeline(self):
+        raw_nodes = {"items": []}
+        for role in ct.COMPACT_ROLES:
+            raw_nodes["items"].append({
+                "metadata": {
+                    "name": role,
+                    "annotations": {
+                        "machineconfiguration.openshift.io/currentConfig": "rendered-master-old",
+                        "machineconfiguration.openshift.io/desiredConfig": "rendered-master-new",
+                        "machineconfiguration.openshift.io/state": "Working",
+                        "machineconfiguration.openshift.io/reason": "Updating files",
+                    },
+                },
+                "spec": {"unschedulable": role == "master-0-1"},
+                "status": {"conditions": [{
+                    "type": "Ready", "status": "False", "reason": "KubeletNotReady",
+                    "message": "Node is rebooting", "lastTransitionTime": "2026-10-23T21:00:00Z",
+                }]},
+            })
+
+        observations = ct.compact_machine_config_node_observations(
+            ct.compact_parse_node_docs(json.dumps(raw_nodes)))
+        second_master = observations[1]
+        self.assertEqual(second_master["ready"], "False")
+        self.assertEqual(second_master["ready_reason"], "KubeletNotReady")
+        self.assertEqual(second_master["ready_transition"], "2026-10-23T21:00:00Z")
+        self.assertTrue(second_master["unschedulable"])
+        self.assertEqual(second_master["state"], "Working")
+        self.assertEqual(second_master["current"], "rendered-master-old")
+        self.assertEqual(second_master["desired"], "rendered-master-new")
+
+        raw_nodes["items"][1]["spec"]["unschedulable"] = False
+        raw_nodes["items"][1]["metadata"]["annotations"].update({
+            "machineconfiguration.openshift.io/currentConfig": "rendered-master-new",
+            "machineconfiguration.openshift.io/state": "Done",
+        })
+        raw_nodes["items"][1]["status"]["conditions"][0].update({
+            "status": "True", "reason": "KubeletReady",
+            "message": "kubelet is posting ready status",
+            "lastTransitionTime": "2026-10-23T21:05:00Z",
+        })
+        recovered = ct.compact_machine_config_node_observations(
+            ct.compact_parse_node_docs(json.dumps(raw_nodes)))[1]
+        self.assertNotEqual(second_master, recovered)
+        self.assertEqual(recovered["ready"], "True")
+        self.assertEqual(recovered["current"], "rendered-master-new")
+        self.assertEqual(recovered["state"], "Done")
+
+    def test_machine_config_gate_requires_updated_pool_and_every_master(self):
+        desired = "rendered-master-edge20"
+        nodes = [{
+            "name": role, "current_config": desired, "desired_config": desired,
+            "mcd_state": "Done", "mcd_reason": "",
+        } for role in ct.COMPACT_ROLES]
+        pool = {
+            "spec": {"configuration": {"name": desired}},
+            "status": {
+                "configuration": {"name": desired},
+                "conditions": [
+                    {"type": "Updated", "status": "True"},
+                    {"type": "Updating", "status": "False"},
+                    {"type": "Degraded", "status": "False"},
+                ],
+            },
+        }
+        self.assertTrue(ct.compact_machine_config_observation(json.dumps(pool), nodes)[0])
+
+        nodes[1]["current_config"] = "rendered-master-old"
+        ready, detail, observed = ct.compact_machine_config_observation(json.dumps(pool), nodes)
+        self.assertFalse(ready)
+        self.assertEqual(observed, desired)
+        self.assertIn("master-0-1", detail)
+
+        nodes[1]["current_config"] = desired
+        pool["status"]["conditions"][0]["status"] = "False"
+        self.assertFalse(ct.compact_machine_config_observation(json.dumps(pool), nodes)[0])
+
+    def test_machineconfig_retry_canonicalizes_only_once(self):
+        domain = "test-infra-cluster-edge20.redhat.com"
+        body = f"KUBERNETES_SERVICE_HOST='api-int.{domain}'\nKUBERNETES_SERVICE_PORT='6443'\n"
+        source = "data:;base64," + base64.b64encode(body.encode()).decode()
+        original = json.dumps({"spec": {"config": {"storage": {"files": [{
+            "path": "/etc/kubernetes/apiserver-url.env",
+            "contents": {"source": source},
+        }]}}}})
+
+        first = ct.compact_ensure_machineconfig_render_change(original, original, domain)
+        second = ct.compact_ensure_machineconfig_render_change(first, first, domain)
+        first_doc = json.loads(first)
+        second_doc = json.loads(second)
+        first_source = first_doc["spec"]["config"]["storage"]["files"][0]["contents"]["source"]
+        second_source = second_doc["spec"]["config"]["storage"]["files"][0]["contents"]["source"]
+        self.assertEqual(first_source, "data:," + urllib.parse.quote(body, safe=""))
+        self.assertEqual(second_source, first_source)
+        self.assertEqual(
+            ct.rendered_machineconfig_files(first_doc)["/etc/kubernetes/apiserver-url.env"], body)
+
+    def test_compact_mco_source_identity_matches_clone_infrastructure(self):
+        domain = "test-infra-cluster-edge21.redhat.com"
+        api_vip = "192.168.221.5"
+        subnet = 221
+        infra = {
+            "apiVersion": "config.openshift.io/v1",
+            "kind": "Infrastructure",
+            "spec": {"platformSpec": {"baremetal": {
+                "apiServerInternalIPs": [api_vip],
+                "machineNetworks": ["192.168.221.0/24"],
+            }}},
+            "status": {
+                "apiServerInternalURI": f"https://api-int.{domain}:6443",
+                "apiServerURL": f"https://api.{domain}:6443",
+                "platformStatus": {"baremetal": {
+                    "apiServerInternalIP": api_vip,
+                    "apiServerInternalIPs": [api_vip],
+                    "machineNetworks": ["192.168.221.0/24"],
+                }},
+            },
+        }
+        controllerconfig = {"spec": {"infra": infra}}
+        self.assertTrue(ct.compact_controllerconfig_infra_matches(
+            controllerconfig, domain, api_vip, subnet))
+        stale_controllerconfig = json.loads(json.dumps(controllerconfig))
+        stale_controllerconfig["spec"]["infra"]["status"]["apiServerInternalURI"] = (
+            "https://api-int.edge16-24g.redhat.com:6443")
+        self.assertFalse(ct.compact_controllerconfig_infra_matches(
+            stale_controllerconfig, domain, api_vip, subnet))
+
+        api_url = (
+            f"KUBERNETES_SERVICE_HOST='api-int.{domain}'\n"
+            "KUBERNETES_SERVICE_PORT='6443'\n")
+        source = "data:," + urllib.parse.quote(api_url, safe="")
+        machineconfig = {"spec": {"config": {"storage": {"files": [{
+            "path": "/etc/kubernetes/apiserver-url.env",
+            "contents": {"source": source},
+        }]}}}}
+        self.assertTrue(ct.compact_machineconfig_input_has_clone_api_url(
+            machineconfig, domain))
+        machineconfig["spec"]["config"]["storage"]["files"][0]["contents"]["source"] = (
+            "data:," + urllib.parse.quote(
+                "KUBERNETES_SERVICE_HOST='api-int.edge16-24g.redhat.com'\n", safe=""))
+        self.assertFalse(ct.compact_machineconfig_input_has_clone_api_url(
+            machineconfig, domain))
+
+    def test_kubernetes_endpoint_check_rejects_stale_addresses(self):
+        clone_ips = ["192.168.220.69", "192.168.220.81", "192.168.220.89"]
+        endpoints, endpoint_slice = self._kubernetes_endpoint_fixtures(clone_ips)
+        endpoints_doc = json.loads(endpoints)
+        endpoints_doc["subsets"][0]["addresses"].append({"ip": "192.168.123.65"})
+        ready, detail = ct.compact_kubernetes_endpoints_ready(
+            json.dumps(endpoints_doc), endpoint_slice, clone_ips)
+        self.assertFalse(ready)
+        self.assertIn("192.168.123.65", detail)
+        self.assertEqual(
+            ct.compact_kubernetes_endpoint_managers(endpoints, endpoint_slice),
+            "kube-controller-manager")
+
+    def test_kubernetes_endpoint_check_requires_tcp_6443_on_ready_subset(self):
+        clone_ips = ["192.168.220.69", "192.168.220.81", "192.168.220.89"]
+        endpoints, endpoint_slice = self._kubernetes_endpoint_fixtures(clone_ips)
+        endpoints_doc = json.loads(endpoints)
+        endpoints_doc["subsets"] = [
+            {
+                "addresses": [{"ip": clone_ips[0]}],
+                "ports": [{"name": "https", "port": 9999, "protocol": "TCP"}],
+            },
+            {
+                "notReadyAddresses": [{"ip": ip} for ip in clone_ips[1:]],
+                "ports": [{"name": "https", "port": 6443, "protocol": "TCP"}],
+            },
+        ]
+        ready, detail = ct.compact_kubernetes_endpoints_ready(
+            json.dumps(endpoints_doc), endpoint_slice, clone_ips)
+        self.assertFalse(ready)
+        self.assertIn("ready Endpoints subset lacks HTTPS/TCP/6443", detail)
+
+    def test_kubernetes_endpoint_check_rejects_udp_6443(self):
+        clone_ips = ["192.168.220.69", "192.168.220.81", "192.168.220.89"]
+        endpoints, endpoint_slice = self._kubernetes_endpoint_fixtures(clone_ips)
+        endpoints_doc = json.loads(endpoints)
+        endpoints_doc["subsets"][0]["ports"][0]["protocol"] = "UDP"
+        ready, detail = ct.compact_kubernetes_endpoints_ready(
+            json.dumps(endpoints_doc), endpoint_slice, clone_ips)
+        self.assertFalse(ready)
+        self.assertIn("ready Endpoints subset lacks HTTPS/TCP/6443", detail)
+
+        endpoints_doc["subsets"][0]["ports"][0].update({
+            "name": "api-alt", "protocol": "TCP",
+        })
+        ready, detail = ct.compact_kubernetes_endpoints_ready(
+            json.dumps(endpoints_doc), endpoint_slice, clone_ips)
+        self.assertFalse(ready)
+        self.assertIn("ready Endpoints subset lacks HTTPS/TCP/6443", detail)
+
+        endpoints_doc["subsets"][0]["ports"][0]["name"] = "https"
+        endpoints_doc["subsets"][0]["ports"][0]["protocol"] = "TCP"
+        slice_doc = json.loads(endpoint_slice)
+        slice_doc["ports"][0]["protocol"] = "UDP"
+        ready, detail = ct.compact_kubernetes_endpoints_ready(
+            json.dumps(endpoints_doc), json.dumps(slice_doc), clone_ips)
+        self.assertFalse(ready)
+        self.assertIn("EndpointSlice has no effective HTTPS/TCP/6443", detail)
+
+    def test_endpoint_observation_failures_do_not_consume_repair_budget(self):
+        good = MagicMock(returncode=0, stdout='{"metadata":{}}', stderr="")
+        unavailable = MagicMock(returncode=1, stdout="", stderr="temporary timeout")
+        readable, detail = ct.compact_kubernetes_endpoint_observation(good, unavailable)
+        self.assertFalse(readable)
+        self.assertIn("temporary timeout", detail)
+        malformed = MagicMock(returncode=0, stdout='{"subsets":"bad"}', stderr="")
+        readable, detail = ct.compact_kubernetes_endpoint_observation(malformed, good)
+        self.assertFalse(readable)
+        self.assertIn("subsets was not a list", detail)
+        self.assertEqual(ct.compact_next_endpoint_repair_failures(2, False, False), 2)
+        self.assertEqual(ct.compact_next_endpoint_repair_failures(2, True, False), 3)
+        self.assertEqual(ct.compact_next_endpoint_repair_failures(2, True, True), 0)
+
+    def test_unavailable_endpoint_reads_return_unknown_repair_result(self):
+        class _Env:
+            def run(self, cmd, check=True):
+                return MagicMock(returncode=1, stdout="", stderr="temporary timeout")
+
+        monotonic_values = iter([0, 0, 0, 11])
+        with (patch.object(ct, "env", _Env()),
+              patch.object(ct.time, "monotonic", side_effect=lambda: next(monotonic_values)),
+              patch.object(ct.time, "sleep"), patch("builtins.print")):
+            result = ct._refresh_compact_kubernetes_endpoints(
+                "oc", [{"ip": "192.168.220.69"}], "/work", timeout_seconds=10)
+        self.assertIsNone(result)
+
+    def test_missing_endpoint_slice_reports_controller_owned_recovery_limit(self):
+        clone_ips = ["192.168.220.69", "192.168.220.81", "192.168.220.89"]
+        endpoints, _ = self._kubernetes_endpoint_fixtures(clone_ips)
+
+        class _Env:
+            def run(self, cmd, check=True):
+                if "get endpointslice kubernetes" in cmd:
+                    return MagicMock(returncode=1, stdout="", stderr="NotFound")
+                return MagicMock(returncode=0, stdout=endpoints, stderr="")
+
+        monotonic_values = iter([0, 0, 0, 181])
+        with (patch.object(ct, "env", _Env()),
+              patch.object(ct.time, "monotonic", side_effect=lambda: next(monotonic_values)),
+              patch.object(ct.time, "sleep"), patch("builtins.print")):
+            with self.assertRaises(SystemExit) as aborted:
+                ct._refresh_compact_kubernetes_endpoints(
+                    "oc", [{"ip": ip} for ip in clone_ips], "/work", timeout_seconds=180)
+        self.assertIn("automatic creation is unsupported", str(aborted.exception))
+
+    def test_kubernetes_endpoint_repair_is_noop_when_identity_is_correct(self):
+        clone_ips = ["192.168.220.69", "192.168.220.81", "192.168.220.89"]
+        endpoint_raw, slice_raw = self._kubernetes_endpoint_fixtures(clone_ips)
+
+        class _Env:
+            def __init__(self):
+                self.calls = []
+
+            def run(self, cmd, check=True):
+                self.calls.append(cmd)
+                result = MagicMock(returncode=0, stderr="", stdout="")
+                if "get endpointslice kubernetes" in cmd:
+                    result.stdout = slice_raw
+                elif "get endpoints kubernetes" in cmd:
+                    result.stdout = endpoint_raw
+                return result
+
+        fake_env = _Env()
+        with patch.object(ct, "env", fake_env), patch("builtins.print"):
+            self.assertTrue(ct._refresh_compact_kubernetes_endpoints(
+                "oc", [{"ip": ip} for ip in clone_ips], "/work"))
+        self.assertFalse(any("curl " in cmd or " patch endpoints" in cmd for cmd in fake_env.calls))
+
+    def test_kubernetes_endpoint_repair_retries_temporary_backend_unavailability(self):
+        clone_ips = ["192.168.220.69", "192.168.220.81", "192.168.220.89"]
+        source_ips = ["192.168.123.64"]
+        stale_endpoints, stale_slice = self._kubernetes_endpoint_fixtures(source_ips)
+        good_endpoints, good_slice = self._kubernetes_endpoint_fixtures(clone_ips)
+
+        class _Env:
+            def __init__(self):
+                self.calls = []
+                self.endpoints = stale_endpoints
+                self.endpoint_slice = stale_slice
+
+            def run(self, cmd, check=True):
+                self.calls.append(cmd)
+                result = MagicMock(returncode=0, stderr="", stdout="")
+                if "get endpointslice kubernetes" in cmd:
+                    result.stdout = self.endpoint_slice
+                elif "get endpoints kubernetes" in cmd:
+                    result.stdout = self.endpoints
+                elif "patch endpointslice kubernetes" in cmd:
+                    self.endpoint_slice = good_slice
+                elif "patch endpoints kubernetes" in cmd:
+                    self.endpoints = good_endpoints
+                return result
+
+        failed = [MagicMock(returncode=1) for _ in clone_ips]
+        succeeded = [MagicMock(returncode=0) for _ in clone_ips]
+        fake_env = _Env()
+        with (patch.object(ct, "env", fake_env),
+              patch.object(ct, "_in_parallel_results", side_effect=[failed, succeeded]),
+              patch("time.sleep"), patch("builtins.print")):
+            self.assertTrue(ct._refresh_compact_kubernetes_endpoints(
+                "oc", [{"ip": ip} for ip in clone_ips], "/work"))
+        self.assertTrue(any("patch endpoints kubernetes" in cmd for cmd in fake_env.calls))
+        self.assertTrue(any("patch endpointslice kubernetes" in cmd for cmd in fake_env.calls))
+        self.assertGreaterEqual(sum("get endpoints kubernetes" in cmd for cmd in fake_env.calls), 2)
+
+    def test_kubernetes_endpoint_repair_corrects_endpoint_slice_port(self):
+        clone_ips = ["192.168.220.69", "192.168.220.81", "192.168.220.89"]
+        good_endpoints, good_slice = self._kubernetes_endpoint_fixtures(clone_ips)
+        wrong_slice_doc = json.loads(good_slice)
+        wrong_slice_doc["ports"] = [{"name": "https", "port": 9999, "protocol": "UDP"}]
+
+        class _Env:
+            def __init__(self):
+                self.calls = []
+                self.endpoint_slice = json.dumps(wrong_slice_doc)
+
+            def run(self, cmd, check=True):
+                self.calls.append(cmd)
+                if "get endpointslice kubernetes" in cmd:
+                    return MagicMock(returncode=0, stdout=self.endpoint_slice, stderr="")
+                if "get endpoints kubernetes" in cmd:
+                    return MagicMock(returncode=0, stdout=good_endpoints, stderr="")
+                if "patch endpointslice kubernetes" in cmd:
+                    self.endpoint_slice = good_slice
+                return MagicMock(returncode=0, stdout="", stderr="")
+
+        fake_env = _Env()
+        probes = [[MagicMock(returncode=0) for _ in clone_ips]]
+        with (patch.object(ct, "env", fake_env),
+              patch.object(ct, "_in_parallel_results", side_effect=probes),
+              patch("time.sleep"), patch("builtins.print")):
+            self.assertTrue(ct._refresh_compact_kubernetes_endpoints(
+                "oc", [{"ip": ip} for ip in clone_ips], "/work"))
+        slice_patch = next(
+            cmd for cmd in fake_env.calls if "patch endpointslice kubernetes" in cmd)
+        self.assertIn('"port": 6443', slice_patch)
+        self.assertIn('"protocol": "TCP"', slice_patch)
+
+    def test_kubernetes_endpoint_repair_rejects_unverified_patch(self):
+        clone_ips = ["192.168.220.69", "192.168.220.81", "192.168.220.89"]
+        source_ips = ["192.168.123.64"]
+        stale_endpoints, stale_slice = self._kubernetes_endpoint_fixtures(source_ips)
+
+        class _Env:
+            def __init__(self):
+                self.calls = []
+
+            def run(self, cmd, check=True):
+                self.calls.append(cmd)
+                return MagicMock(returncode=0, stderr="", stdout=(
+                    stale_slice if "endpointslice kubernetes" in cmd else stale_endpoints
+                ))
+
+        fake_env = _Env()
+        probes = [[MagicMock(returncode=0) for _ in clone_ips] for _ in range(3)]
+        with (patch.object(ct, "env", fake_env),
+              patch.object(ct, "_in_parallel_results", side_effect=probes),
+              patch("time.sleep"), patch("builtins.print")):
+            self.assertFalse(ct._refresh_compact_kubernetes_endpoints(
+                "oc", [{"ip": ip} for ip in clone_ips], "/work"))
+        self.assertEqual(sum("patch endpoints kubernetes" in cmd for cmd in fake_env.calls), 3)
+
+    def test_apiserver_etcd_trust_copy_uses_only_the_quorum_ca(self):
+        command = ct.compact_apiserver_etcd_trust_tar_command()
+        self.assertIn("etcd-serving-ca/ca-bundle.crt", command)
+        self.assertIn("etcd-client/tls.crt", command)
+        self.assertIn("etcd-client/tls.key", command)
+        self.assertNotIn("kubelet-serving-ca", command)
+        self.assertNotIn("client-ca/ca-bundle.crt", command)
+        self.assertEqual(
+            ct.compact_new_rendered_master(
+                "rendered-master-f91e5e3bbeff38fff5ddf87f21226386",
+                "rendered-master-25faeae1e446640a1292f9d060699092"),
+            "rendered-master-25faeae1e446640a1292f9d060699092")
+        self.assertEqual(
+            ct.compact_new_rendered_master(
+                "rendered-master-f91e5e3bbeff38fff5ddf87f21226386",
+                "rendered-master-f91e5e3bbeff38fff5ddf87f21226386"),
+            "")
+        decoded = ct.rendered_machineconfig_files({
+            "spec": {"config": {"storage": {"files": [{
+                "path": "/etc/kubernetes/apiserver-url.env",
+                "contents": {"source": "data:,KUBERNETES_SERVICE_HOST%3Dapi-int.example.com%0A"},
+            }]}}}
+        })
+        self.assertEqual(
+            decoded["/etc/kubernetes/apiserver-url.env"],
+            "KUBERNETES_SERVICE_HOST=api-int.example.com\n")
+
+    def test_clone_log_includes_a_timestamp(self):
+        ct.env = MagicMock()
+        with patch("builtins.print") as printed:
+            ct._clone_log("/var/lib/libvirt/images/edge1", "copy the three flavor disks")
+        line = printed.call_args.args[0]
+        self.assertRegex(
+            line,
+            r"^===== \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} copy the three flavor disks =====$")
+        logged = ct.env.run.call_args.args[0]
+        self.assertIn(line, logged)
+
+    def test_inspect_summary_omits_addresses(self):
+        text = ct.format_compact_inspect({
+            "nodes": [{"role": "master-0-0", "ip": "192.168.124.69", "mac": "02:00:00:00:00:01"}],
+            "gateway": "192.168.124.1",
+        })
+        self.assertIn("master-0-0", text)
+        self.assertNotIn("192.168.", text)
+        self.assertNotIn("02:00", text)
+
+    def test_rhcos_deploy_uses_booted_ostree_status(self):
+        names = ["abc.0.origin", "abc.0", "def.1"]
+        self.assertEqual(ct.choose_rhcos_deploy(names, "abc.0"), "abc.0")
+        self.assertEqual(ct.choose_rhcos_deploy(["only.0", "only.0.origin"]), "only.0")
+        with self.assertRaises(SystemExit) as ctx:
+            ct.choose_rhcos_deploy(names)
+        self.assertIn("multiple RHCOS deployments", str(ctx.exception))
+        self.assertEqual(
+            ct.parse_booted_ostree_deployment("* rhcos abcdef0123456789.0\n  rhcos 123456789abcdef0.0\n"),
+            "abcdef0123456789.0")
+
+    def test_identity_rewrite_preserves_pem_only_input_exactly(self):
+        pem_only = (
+            "bundle: |\n"
+            "  -----BEGIN CERTIFICATE-----\n"
+            "  MIIB\n"
+            "  -----END CERTIFICATE-----\n")
+        self.assertEqual(
+            ct.apply_identity_preserving_pems(pem_only, [("unused", "replacement")]),
+            pem_only)
+
+
 class TestFlavorState(unittest.TestCase):
     def setUp(self):
         self.mock_env = MockStateEnv()
@@ -1248,6 +3329,8 @@ class TestSnapshot(unittest.TestCase):
                 r.stdout = ""
             elif "virsh domstate" in cmd:
                 r.stdout = "shut off" if shutdown_called["v"] else "running"
+            elif "ostree admin status" in cmd:
+                r.stdout = "* rhcos abcdef0123456789.0\n  rhcos 0123456789abcdef.0\n"
             elif "ingress-cn" in cmd or "subject" in cmd:
                 r.stdout = "fake-ingress-cn"
             elif "python3" in cmd and "etcd" in cmd:
@@ -1297,6 +3380,7 @@ class TestSnapshot(unittest.TestCase):
         self.assertEqual(flavor["vcpus"], 16)
         self.assertEqual(flavor["memory_kib"], 67108864)
         self.assertEqual(flavor["disks"], ["disk-0.qcow2"])
+        self.assertEqual(flavor["rhcos_deployment"], "abcdef0123456789.0")
 
     @patch("time.sleep")
     def test_snapshot_existing_flavor_exits(self, _):
@@ -2012,7 +4096,7 @@ class TestSetupClient(unittest.TestCase):
         resolv.write_text("nameserver 127.0.0.1\n")
 
         with patch.dict(os.environ, {"SUDO_USER": "testuser"}), \
-             patch.object(ct, "DNSMASQ_DIR", dnsmasq_dir), \
+             patch.object(ct, "_dnsmasq_dir", return_value=dnsmasq_dir), \
              patch("pathlib.Path", wraps=Path) as mock_path:
             orig_path = Path
             class PatchedPath(type(Path())):
@@ -2554,6 +4638,20 @@ class TestRunVmQuoting(unittest.TestCase):
         self.assertIsInstance(captured["args"], list)
         self.assertEqual(captured["args"][-1], "sudo python3 -c \"open('/etc/test')\"")
 
+    def test_remote_run_vm_quotes_identity(self):
+        self.env.run_vm("192.168.1.10", "echo hello", identity="/tmp/key;touch /tmp/pwned")
+        self.assertNotIn("-i /tmp/key;touch", self.captured_cmd)
+        self.assertIn(shlex.quote("/tmp/key;touch /tmp/pwned"), self.captured_cmd)
+
+    def test_remote_write_expands_home(self):
+        with patch("subprocess.run") as run:
+            run.return_value = MagicMock(returncode=0, stderr="")
+            self.env.write_file("~/.config/cluster-tool/state.json", "{}")
+        remote = run.call_args.args[0][-1]
+        self.assertIn('"$HOME"', remote)
+        self.assertIn("mkdir -p", remote)
+        self.assertNotIn("'~/", remote)
+
 
 class TestPullSecretInjection(unittest.TestCase):
     _INITIAL_STATE = TestTransactionalBoot._INITIAL_STATE
@@ -2574,7 +4672,9 @@ class TestPullSecretInjection(unittest.TestCase):
     def _boot_args(self, pull_secret=_SENTINEL):
         if pull_secret is TestPullSecretInjection._SENTINEL:
             pull_secret = self._ps_file.name
-        return argparse.Namespace(name="aabbccdd", flavor="default", no_rollback=False, pull_secret=pull_secret)
+        return argparse.Namespace(
+            name="aabbccdd", flavor="default", no_rollback=False,
+            pull_secret=pull_secret, vcpus=None, memory_kib=None)
 
     def _make_all_succeed_ssh(self):
         mock_co = TestTransactionalBoot._MOCK_CO_JSON
@@ -2693,4 +4793,3 @@ class TestPullSecretInjection(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
