@@ -1294,6 +1294,7 @@ def compact_controllerconfig_dns_matches(raw, expected_dns, clone_domain):
         and (current.get("spec") or {}).get("baseDomain") == clone_domain
     )
 HEAL_NODE_FILES = (
+    "/var/lib/kubelet/config.json",
     "/var/lib/kubelet/kubeconfig",
     "/etc/kubernetes/kubeconfig",
     "/etc/kubernetes/apiserver-url.env",
@@ -1302,6 +1303,16 @@ HEAL_NODE_FILES = (
     "/usr/local/bin/resolv-prepender.sh",
     "/etc/systemd/system/nodeip-configuration.service",
 )
+
+
+def compact_heal_node_files(render):
+    """Select rendered files that compact boot applies before MCD handoff."""
+    return {
+        path: body for path, body in rendered_machineconfig_files(render).items()
+        if path in HEAL_NODE_FILES
+    }
+
+
 HEAL_API_OBJECTS = (
     ("daemonset", "openshift-network-node-identity", "network-node-identity"),
     ("daemonset", "openshift-ovn-kubernetes", "ovnkube-node"),
@@ -4717,14 +4728,11 @@ def _apply_compact_identity_phase(ctx, clone_oc):
         sys.exit(
             f"MCP returned render {rendered}, but the MachineConfig is "
             f"{desired_master_render}. Log: {work}/clone.log")
-    env.write_file(f"{work}/currentconfig.json", raw_render_text)
-    heal_files = {
-        path: body for path, body in rendered_machineconfig_files(raw_render_text).items()
-        if path in HEAL_NODE_FILES
-    }
+    env.write_file(f"{work}/currentconfig.json", raw_render_text, private=True)
+    heal_files = compact_heal_node_files(raw_render_text)
     if heal_files.get("/etc/kubernetes/apiserver-url.env") != expected_api_url:
         sys.exit("The desired render is missing the clone API URL file")
-    env.write_file(f"{work}/heal-files.json", json.dumps(heal_files))
+    env.write_file(f"{work}/heal-files.json", json.dumps(heal_files), private=True)
     env.write_file(f"{work}/apply-heal-files.py", textwrap.dedent("""\
         import json
         import pathlib
@@ -4736,7 +4744,13 @@ def _apply_compact_identity_phase(ctx, clone_oc):
             raise SystemExit("currentconfig does not match the desired render")
         files = json.load(open("/var/tmp/heal-files.json"))
         for path, body in files.items():
-            pathlib.Path(path).write_text(body)
+            candidate = pathlib.Path(path)
+            if path in (
+                    "/var/lib/kubelet/config.json",
+                    "/var/lib/kubelet/kubeconfig",
+                    "/etc/kubernetes/kubeconfig"):
+                candidate.chmod(0o600)
+            candidate.write_text(body)
         for path, body in files.items():
             candidate = pathlib.Path(path)
             if not candidate.is_file() or candidate.read_text() != body:
@@ -4746,12 +4760,13 @@ def _apply_compact_identity_phase(ctx, clone_oc):
 
     def install_render(node):
         env.run(
-            "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
+            "scp -p " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
             f"{shlex.quote(work + '/currentconfig.json')} {shlex.quote(work + '/heal-files.json')} "
             f"{shlex.quote(work + '/apply-heal-files.py')} "
             f"core@{node['ip']}:/var/tmp/")
         _vm(node["ip"], textwrap.dedent("""\
             set -euo pipefail
+            sudo chmod 600 /etc/machine-config-daemon/currentconfig
             sudo cp /var/tmp/currentconfig.json /etc/machine-config-daemon/currentconfig
             sudo restorecon /etc/machine-config-daemon/currentconfig || true
             sudo python3 /var/tmp/apply-heal-files.py
