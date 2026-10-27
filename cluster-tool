@@ -4817,8 +4817,20 @@ def _wait_compact_install_ready(
     last_observe_signature = None
     endpoint_repair_failures = 0
     endpoint_detail = "not observed"
+    membership_detail = "not observed"
     mcd_addresses_verified = False
     endpoints = ",".join(f"https://{node['ip']}:2379" for node in nodes)
+    etcdctl = (
+        "sudo podman run --rm --network host --privileged --authfile /var/lib/kubelet/config.json "
+        "-v /etc/kubernetes/static-pod-resources/etcd-certs:/certs:ro "
+        f"--entrypoint etcdctl {shlex.quote(etcd_image)} "
+    )
+    etcdctl_auth = (
+        f"--endpoints={endpoints} "
+        "--cacert /certs/configmaps/etcd-all-bundles/server-ca-bundle.crt "
+        "--cert /certs/secrets/etcd-all-certs/etcd-peer-master-0-1.crt "
+        "--key /certs/secrets/etcd-all-certs/etcd-peer-master-0-1.key -w json"
+    )
     while time.time() < deadline:
         watched = _call_together({
             "nodes": lambda: env.run(f"{clone_oc} get nodes -o json", check=False),
@@ -5076,32 +5088,44 @@ def _wait_compact_install_ready(
                 "-o jsonpath='{.status.desiredNumberScheduled} {.status.updatedNumberScheduled} {.status.numberReady}'",
                 check=False),
             "etcd": lambda: _vm(api_ip,
-                "sudo podman run --rm --network host --privileged --authfile /var/lib/kubelet/config.json "
-                "-v /etc/kubernetes/static-pod-resources/etcd-certs:/certs:ro "
-                f"--entrypoint etcdctl {shlex.quote(etcd_image)} endpoint status "
-                f"--endpoints={endpoints} "
-                "--cacert /certs/configmaps/etcd-all-bundles/server-ca-bundle.crt "
-                "--cert /certs/secrets/etcd-all-certs/etcd-peer-master-0-1.crt "
-                "--key /certs/secrets/etcd-all-certs/etcd-peer-master-0-1.key -w json",
+                etcdctl + "endpoint status " + etcdctl_auth,
+                identity, check=False),
+            "etcd_membership": lambda: _vm(api_ip,
+                etcdctl + "member list " + etcdctl_auth,
                 identity, check=False),
             "auth": lambda: compact_admin_auth_results(clone_kc, nodes),
             "domains": lambda: compact_identity_domains(clone_oc),
             "api_url_files": lambda: _in_parallel_results(nodes, lambda node: _vm(
                 node["ip"], "sudo cat /etc/kubernetes/apiserver-url.env", identity, check=False)),
         })
-        try:
-            status = json.loads(probes["etcd"].stdout or "[]")
-        except json.JSONDecodeError:
+        status = []
+        if probes["etcd"].returncode == 0:
+            try:
+                status = json.loads(probes["etcd"].stdout or "[]")
+            except json.JSONDecodeError:
+                pass
+        if not isinstance(status, list):
             status = []
+        membership_ready, membership_detail = compact_etcd_membership_status(
+            probes["etcd_membership"].stdout if probes["etcd_membership"].returncode == 0 else "",
+            status, nodes)
         members = []
         for item in status:
+            if not isinstance(item, dict):
+                continue
             body = item.get("Status") or {}
+            if not isinstance(body, dict):
+                continue
             header = body.get("header") or {}
+            if not isinstance(header, dict):
+                continue
             members.append({
                 "started": "error" not in item and bool(header.get("member_id")),
                 "leader": header.get("member_id") is not None and header.get("member_id") == body.get("leader"),
             })
         health = compact_health(parsed_nodes, members, operators)
+        health["membership_ready"] = membership_ready
+        health["ok"] = health["ok"] and membership_ready
         etcd_pods = parse_etcd_pods(probes["pods"].stdout or "")
         nni_parts = (probes["nni"].stdout or "").split()
         nni_ready = (
@@ -5114,6 +5138,8 @@ def _wait_compact_install_ready(
         last = health
         stage = compact_readiness_stage(
             health["ready"], addresses_ok, health["etcd_started"], etcd_pods, health["leader"], core_unhealthy)
+        if stage == "core-ready" and not membership_ready:
+            stage = "etcd-rollout"
         admin_auth = probes["auth"]
         admin_failed = [item["role"] for item in admin_auth if not item["ok"]]
         sa_failed = []
@@ -5138,16 +5164,19 @@ def _wait_compact_install_ready(
             f"ingress={domains['apps_domain'] or 'missing'}"
         )
         last_domains = domain_detail
-        etcd_sample = (health["etcd_started"], etcd_pods, bool(health["leader"]), "etcd" in core_unhealthy)
+        etcd_sample = (
+            health["etcd_started"], etcd_pods, bool(health["leader"]),
+            "etcd" in core_unhealthy, membership_detail)
         if etcd_sample != last_etcd_sample:
             _clone_log(
                 work,
                 f"etcd rollout started={health['etcd_started']} pods={etcd_pods} "
-                f"leader={health['leader']} progressing={'etcd' in core_unhealthy}")
+                f"leader={health['leader']} progressing={'etcd' in core_unhealthy} "
+                f"membership={membership_detail}")
             last_etcd_sample = etcd_sample
         install_ready = (
             not install_blockers and revisions_ready and machine_config_ready
-            and not api_url_blockers and endpoint_ready
+            and not api_url_blockers and endpoint_ready and membership_ready
         )
         stable_samples = compact_next_stable_samples(
             stable_samples, stage, auth_ready, domains_ready, install_ready)
@@ -5164,7 +5193,8 @@ def _wait_compact_install_ready(
             work,
             f"health stage={reported_stage} stable={stable_samples} "
             f"ready={health['ready']} etcd={health['etcd_started']} leader={health['leader']} "
-            f"etcdpods={etcd_pods} ips={'ok' if addresses_ok else 'stale'} "
+            f"etcdpods={etcd_pods} membership={membership_detail} "
+            f"ips={'ok' if addresses_ok else 'stale'} "
             f"core={','.join(core_unhealthy) or 'none'} "
             f"install={','.join(install_blockers) or 'none'} "
             f"mco={'ready' if machine_config_ready else 'blocked'} "
@@ -5194,6 +5224,7 @@ def _wait_compact_install_ready(
     sys.exit(
         f"Clone did not become healthy within 40 minutes: {last} auth={last_auth} "
         f"{last_domains} machine-config={last_mco_detail} api-endpoints={endpoint_detail} "
+        f"etcd-membership={membership_detail} "
         f"apiserver-url={','.join(last_api_url_blockers) or 'not-probed'}. "
         f"Log: {work}/clone.log")
 
@@ -6149,6 +6180,56 @@ def compact_next_stable_samples(stable_samples, stage, auth_ready, domains_ready
     return stable_samples + 1
 
 
+def compact_etcd_membership_status(raw, endpoint_status, nodes):
+    """Match live etcd member IDs and peer URLs to the planned clone nodes."""
+    try:
+        document = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return False, "member-list-unavailable"
+    expected = {node["role"]: node["ip"] for node in nodes}
+    if len(nodes) != len(COMPACT_ROLES) or set(expected) != set(COMPACT_ROLES):
+        return False, "invalid-node-plan"
+    member_list = document.get("members") if isinstance(document, dict) else None
+    if not isinstance(member_list, list) or len(member_list) != len(COMPACT_ROLES):
+        return False, "member-count-mismatch"
+    member_ids = {}
+    for member in member_list:
+        if not isinstance(member, dict):
+            return False, "member-identity-mismatch"
+        role = member.get("name")
+        member_id = member.get("ID")
+        if not isinstance(role, str) or role not in expected or role in member_ids:
+            return False, "member-identity-mismatch"
+        if not isinstance(member_id, int) or isinstance(member_id, bool) or member_id <= 0:
+            return False, "member-identity-mismatch"
+        if member.get("peerURLs") != [f"https://{expected[role]}:2380"] or member.get("isLearner", False):
+            return False, "member-identity-mismatch"
+        member_ids[role] = member_id
+    if len(set(member_ids.values())) != len(COMPACT_ROLES):
+        return False, "duplicate-member-id"
+    expected_endpoints = {
+        f"https://{expected[role]}:2379": member_ids[role] for role in COMPACT_ROLES
+    }
+    if not isinstance(endpoint_status, list) or len(endpoint_status) != len(COMPACT_ROLES):
+        return False, "endpoint-member-mismatch"
+    observed_endpoints = {}
+    for item in endpoint_status:
+        if not isinstance(item, dict) or "error" in item:
+            return False, "endpoint-member-mismatch"
+        endpoint = item.get("Endpoint")
+        status = item.get("Status") or {}
+        header = (status.get("header") or {}) if isinstance(status, dict) else {}
+        member_id = header.get("member_id") if isinstance(header, dict) else None
+        if not isinstance(endpoint, str) or endpoint not in expected_endpoints:
+            return False, "endpoint-member-mismatch"
+        if endpoint in observed_endpoints or expected_endpoints[endpoint] != member_id:
+            return False, "endpoint-member-mismatch"
+        observed_endpoints[endpoint] = member_id
+    if set(observed_endpoints) != set(expected_endpoints):
+        return False, "endpoint-member-mismatch"
+    return True, "ok"
+
+
 def compact_health(nodes, etcd_members, operators):
     """Decide whether three ready nodes, etcd, and operators meet the pass bar."""
     ready = sum(1 for node in nodes if node.get("ready"))
@@ -6296,7 +6377,7 @@ def require_compact_libvirt_ownership(clone_id):
 
 
 def undefine_compact_libvirt(clone_id):
-    """Destroy only compact guests and network proven to belong to this clone."""
+    """Destroy owned compact resources and confirm none remain."""
     require_compact_libvirt_ownership(clone_id)
     for role in COMPACT_ROLES:
         domain = f"test-infra-cluster-{clone_id}-{role}"
@@ -6305,6 +6386,14 @@ def undefine_compact_libvirt(clone_id):
     net = f"test-infra-net-{clone_id}"
     env.run(f"virsh net-destroy {shlex.quote(net)}", check=False)
     env.run(f"virsh net-undefine {shlex.quote(net)}", check=False)
+    domains = env.run("virsh list --all --name", check=False)
+    if domains.returncode != 0:
+        return False
+    expected = {f"test-infra-cluster-{clone_id}-{role}" for role in COMPACT_ROLES}
+    if expected.intersection(domains.stdout.split()):
+        return False
+    networks = env.run("virsh net-list --all --name", check=False)
+    return networks.returncode == 0 and net not in networks.stdout.split()
 
 
 def gen_compact_network_xml(clone_id, subnet, nodes):
@@ -7288,7 +7377,10 @@ def cmd_destroy(args):
         print(f'Destroying clone "{cid}"...')
         if info.get("topology") == "compact":
             _safe_clone_id(cid)
-            undefine_compact_libvirt(cid)
+            if not undefine_compact_libvirt(cid):
+                sys.exit(
+                    f'Clone "{cid}" still has libvirt resources or cleanup could not be verified; '
+                    "preserving its state and disks for a retry")
             env.run(f"rm -rf {shlex.quote(f'/var/lib/libvirt/images/{cid}')}")
             with locked_state() as saved:
                 saved["clones"].pop(cid, None)
