@@ -2814,6 +2814,19 @@ class TestCompactFlavor(unittest.TestCase):
 
 
 class TestCompactMachineConfig(unittest.TestCase):
+    def test_render_handoff_includes_injected_pull_secret(self):
+        secret = '{"auths":{"quay.io":{"auth":"test"}}}'
+        render = {"spec": {"config": {"storage": {"files": [
+            {"path": "/var/lib/kubelet/config.json", "contents": {
+                "source": "data:;base64," + base64.b64encode(secret.encode()).decode(),
+            }},
+            {"path": "/unrelated/file", "contents": {"source": "data:,other"}},
+        ]}}}}
+
+        self.assertEqual(ct.compact_heal_node_files(render), {
+            "/var/lib/kubelet/config.json": secret,
+        })
+
     def test_machineconfig_retry_reuses_clone_specific_render(self):
         domain = "test-infra-cluster-edge20.redhat.com"
         body = f"KUBERNETES_SERVICE_HOST='api-int.{domain}'\nKUBERNETES_SERVICE_PORT='6443'\n"
@@ -4692,6 +4705,39 @@ class TestRunVmQuoting(unittest.TestCase):
         self.assertIn('"$HOME"', remote)
         self.assertIn("mkdir -p", remote)
         self.assertNotIn("'~/", remote)
+
+
+class TestPrivateWrites(unittest.TestCase):
+    def test_local_private_write_replaces_with_mode_0600_file(self):
+        local = ct.ExecutionEnv(host="local", host_ip="127.0.0.1")
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "pull-secret.json"
+            target.write_text("old")
+            target.chmod(0o644)
+            modes_before_replace = []
+            replace = os.replace
+
+            def inspect_replace(source, destination):
+                modes_before_replace.append(Path(source).stat().st_mode & 0o777)
+                replace(source, destination)
+
+            with patch.object(ct.os, "replace", side_effect=inspect_replace):
+                local.write_file(str(target), "new secret", private=True)
+
+            self.assertEqual(modes_before_replace, [0o600])
+            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(target.read_text(), "new secret")
+
+    def test_remote_private_write_uses_private_temporary_file(self):
+        remote = ct.ExecutionEnv(host="root@test-host", host_ip="10.0.0.1")
+        with patch("subprocess.run") as run:
+            run.return_value = MagicMock(returncode=0, stderr="")
+            remote.write_file("~/clone/pull-secret.json", "sensitive-payload-value", private=True)
+        command = run.call_args.args[0][-1]
+        self.assertIn("mktemp", command)
+        self.assertIn("mv -f", command)
+        self.assertIn('"$HOME"', command)
+        self.assertNotIn("sensitive-payload-value", command)
 
 
 class TestPullSecretInjection(unittest.TestCase):
