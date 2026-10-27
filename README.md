@@ -38,23 +38,25 @@ Single Python 3 file, stdlib only, no installation needed.
 **Server (baremetal):**
 - RHEL, CentOS, or Fedora (uses `dnf`)
 - Root SSH access (passwordless): run `ssh-copy-id root@server` to set up
-- Enough disk space: ~100 GB per flavor, overlays are small (copy-on-write)
-- Enough RAM: each clone uses the flavor's spec (default: 64 GB RAM, 16 vCPUs)
+- Enough disk space for each flavor and clone's disks (see sizing below)
+- Enough RAM and CPU for the VMs in each clone (see sizing below)
 
 Everything else (libvirt, qemu-kvm, podman, pigz, haproxy) is installed automatically by `connect`.
 
 ## Minimum Resource Requirements
 
-Each clone boots a full OpenShift SNO virtual machine. Plan your server hardware accordingly.
+SNO and compact clones use different numbers of VMs and networks. Plan host capacity for every clone that will run at the same time.
 
-### Per-Clone VM Defaults
+### SNO clones
+
+Each SNO clone boots one VM. These defaults come from the flavor and can be overridden at boot.
 
 | Resource | Default | Notes |
 |----------|---------|-------|
 | RAM | 64 GB | Set by the flavor at snapshot time |
 | vCPUs | 16 | Set by the flavor at snapshot time |
 
-### Server Sizing
+### SNO server sizing
 
 | Component | Minimum (1 clone) | Recommended (3 clones) |
 |-----------|--------------------|------------------------|
@@ -64,8 +66,12 @@ Each clone boots a full OpenShift SNO virtual machine. Plan your server hardware
 
 **Disk breakdown:**
 - ~100 GB per flavor (golden qcow2 disk images, 60–90 GB each plus metadata)
-- Overlays per clone are small (copy-on-write, only stores diffs)
+- SNO overlays per clone are small initially (copy-on-write, only stores diffs)
 - Reserve space for container storage (podman image cache, etcd/recert images)
+
+### Compact clones
+
+Each compact clone boots three master VMs. The flavor's RAM and vCPU settings, or the values supplied to `compact-boot`, apply **to each VM**. For example, a 24 GB, 12-vCPU flavor needs 72 GB of VM RAM and 36 vCPUs per clone, plus capacity for the host and other workloads. `compact-boot` copies all flavor disks for each clone, so reserve space for those copies and their growth. Check the flavor's disk count and allocated sizes before running multiple clones.
 
 ### Network
 
@@ -75,8 +81,8 @@ Each clone boots a full OpenShift SNO virtual machine. Plan your server hardware
 | 443 | TCP | Ingress HTTPS (HAProxy SNI routing) |
 | 80 | TCP | Ingress HTTP |
 
-- Each clone allocates two `/24` subnets from the `192.168.x.0` range (primary + secondary at offset +18)
-- Maximum ~90 clones per server before subnet exhaustion
+- Each SNO clone allocates two `/24` subnets from the `192.168.x.0` range (primary + secondary at offset +18). This allows roughly 90 SNO clones before subnet exhaustion.
+- Each compact clone uses one `192.168.x.0/24` subnet. Its three VMs share that network.
 
 ## Where Does It Run?
 
@@ -257,7 +263,7 @@ Flavors are distributed as OCI container images via any registry (Quay.io, Docke
 
 **Push** splits each disk into 1 GB chunks, compresses with pigz (parallel gzip), and builds an OCI image with each chunk as a separate layer. Layers download in parallel (20 concurrent streams).
 
-**Pull** downloads the image, extracts chunks, decompresses in parallel (16 concurrent pigz processes), and reassembles the disks. The flavor is registered and ready for `boot`.
+**Pull** downloads the image, extracts chunks, decompresses in parallel (16 concurrent pigz processes), and reassembles the disks. The flavor is then ready for its matching command: `boot` for SNO or `compact-boot` for a three-master compact cluster.
 
 ```bash
 # Push (runs on the server where the flavor lives)
