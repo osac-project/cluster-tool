@@ -11,11 +11,13 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import textwrap
 import threading
 import time
 import urllib.parse
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import ipaddress
@@ -186,12 +188,23 @@ class ExecutionEnv:
                 capture_output=True, text=True, check=True,
             )
 
-    def write_file(self, path, content):
+    def write_file(self, path, content, *, private=False):
+        """When private, replace the target using a mode-0600 temporary file."""
         if self.is_local:
             resolved = Path(os.path.expanduser(path))
             resolved.parent.mkdir(parents=True, exist_ok=True)
             _restore_ownership(resolved.parent)
-            resolved.write_text(content)
+            if private:
+                fd, temporary = tempfile.mkstemp(prefix=f".{resolved.name}.", dir=resolved.parent)
+                try:
+                    with os.fdopen(fd, "w") as stream:
+                        stream.write(content)
+                    os.replace(temporary, resolved)
+                finally:
+                    if os.path.exists(temporary):
+                        os.unlink(temporary)
+            else:
+                resolved.write_text(content)
             _restore_ownership(resolved)
         else:
             encoded = base64.b64encode(content.encode()).decode()
@@ -200,7 +213,15 @@ class ExecutionEnv:
                 parent = '"$HOME"' + shlex.quote(os.path.dirname(path[1:]) or "/")
             else:
                 parent = shlex.quote(os.path.dirname(path) or ".")
-            remote = f"mkdir -p {parent} && base64 -d > {target}"
+            if private:
+                remote = (
+                    f"mkdir -p {parent} && "
+                    f"tmp=$(mktemp {parent}/.cluster-tool-secret.XXXXXXXX) && "
+                    "trap 'rm -f \"$tmp\"' EXIT && "
+                    f"base64 -d > \"$tmp\" && mv -f \"$tmp\" {target}"
+                )
+            else:
+                remote = f"mkdir -p {parent} && base64 -d > {target}"
             r = subprocess.run(
                 ["ssh"] + SSH_OPTS + [self.host, remote],
                 input=encoded, capture_output=True, text=True,
@@ -3139,8 +3160,9 @@ def compact_configure_runner_kubeconfig(kubeconfig, api_vip, api_server_name):
         detail = (cluster.stderr or "").strip()
         sys.exit(f"Could not find the active cluster in {kubeconfig}: {detail}")
     server = f"https://{api_vip}:6443"
+    env.run(f"chmod 600 {quoted_path}")
     updated = env.run(
-        f"oc config set-cluster {shlex.quote(cluster_name)} --kubeconfig={quoted_path} "
+        f"umask 077 && oc config set-cluster {shlex.quote(cluster_name)} --kubeconfig={quoted_path} "
         f"--server={shlex.quote(server)} --tls-server-name={shlex.quote(api_server_name)}",
         check=False,
     )
@@ -3155,7 +3177,7 @@ def _inject_compact_pull_secret(clone_oc, work, pull_secret):
     if pull_secret is None:
         return
     path = f"{work}/pull-secret.json"
-    env.write_file(path, pull_secret)
+    env.write_file(path, pull_secret, private=True)
     try:
         env.run(f"chmod 600 {shlex.quote(path)}")
         result = env.run(
@@ -3200,7 +3222,7 @@ def compact_serviceaccount_auth_results(oc, nodes, work):
     if minted.returncode != 0 or token.count(".") != 2 or any(char.isspace() for char in token):
         return failed
     path = f"{work}/.sa-probe-token"
-    env.write_file(path, token + "\n")
+    env.write_file(path, token + "\n", private=True)
     env.run(f"chmod 600 {shlex.quote(path)}")
     results = []
     try:
@@ -3250,7 +3272,8 @@ def compact_stash_historical_certs_script():
 def _extract_secret(oc, namespace, name, key, dest):
     """Copy one secret key from the source cluster into the clone crypto directory."""
     env.run(
-        f"{oc} extract secret/{name} -n {namespace} --keys={key} --to=- > {shlex.quote(dest)}")
+        f"umask 077 && {oc} extract secret/{name} -n {namespace} "
+        f"--keys={key} --to=- > {shlex.quote(dest)}")
     env.run(f"chmod 600 {shlex.quote(dest)}")
 
 
@@ -4297,522 +4320,467 @@ def _wait_master_render(clone_oc, previous_render, clone_domain, work):
         f"{error_detail}).")
 
 
-def _finish_compact_clone(
-    source, clone_id, nodes, identity, work, crypto, etcd_image, ingress_cn,
-    plan_path, by_role, api_ip, src_kc, pairs, start_at=None, pull_secret=None,
-):
-    """Finish certificate heal, identity rewrite, and the compact health wait."""
-    etcd_revision_baseline = None
-    apiserver_revision_baseline = None
-    domain = f"test-infra-cluster-{clone_id}.redhat.com"
-    subnet = int(nodes[0]["ip"].split(".")[2])
-    api_vip = f"192.168.{subnet}.{COMPACT_API_SUFFIX}"
-    desired_master_render = ""
-    expected_api_url = ""
-    _clone_log(work, "remove stale source API-server leases from clone etcd")
-    _clear_compact_stale_master_leases(nodes, identity, etcd_image, work)
-    if start_at == "health":
-        loaded = _load_revision_baselines(work)
-        if loaded is None:
-            sys.exit(
-                "Refusing to resume the health check without saved etcd and "
-                f"kube-apiserver revision baselines. Log: {work}/clone.log")
-        etcd_revision_baseline, apiserver_revision_baseline = loaded
-        saved_render = env.run(f"cat {shlex.quote(work + '/currentconfig.json')}", check=False)
-        if saved_render.returncode != 0 or not (saved_render.stdout or "").strip():
-            sys.exit(
-                "Refusing to resume the health check without the desired master render. "
-                f"Log: {work}/clone.log")
-        desired_master_render, expected_api_url = compact_machineconfig_identity(
-            saved_render.stdout, domain)
-        _clone_log(
-            work,
-            "resume at the health check from etcd revision "
-            f"{etcd_revision_baseline} and kube-apiserver revision {apiserver_revision_baseline}")
-    elif start_at == "rewrite":
-        _clone_log(work, "resume after the Recert commit; rewriting cluster records")
-    else:
-        _clone_log(work, "run Recert once on master-0-0")
-        recert_node = by_role[RECERT_ROLE]
-        _vm(recert_node["ip"], compact_stop_workloads_script(), identity)
-        _vm(recert_node["ip"], compact_stash_historical_certs_script(), identity)
-        peers = [by_role[role]["ip"] for role in COMPACT_ROLES if role != RECERT_ROLE]
-        _vm(recert_node["ip"], "sudo podman rm -f etcd-proxy recert >/dev/null 2>&1 || true", identity, check=False)
-        _vm(recert_node["ip"], "sudo mkdir -p /var/tmp/recert-crypto /var/tmp/recert-out && sudo chown core:core /var/tmp/recert-crypto /var/tmp/recert-out", identity)
-        env.run(
-            "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
-            f"{shlex.quote(crypto)}/lb-signer.key {shlex.quote(crypto)}/localhost-signer.key "
-            f"{shlex.quote(crypto)}/service-network-signer.key {shlex.quote(crypto)}/ingress.key "
-            f"core@{recert_node['ip']}:/var/tmp/recert-crypto/")
-        _vm(recert_node["ip"], compact_proxy_command(etcd_image, peers), identity)
-        heal = compact_heal_plan(source, clone_id, nodes, "/tmp/crypto", ingress_cn, plan_path, "/tmp/crypto/csr-signer")
-        recert = _vm(recert_node["ip"], compact_recert_podman_command(heal["recert_once"]["argv"]), identity, check=False)
-        combined = (recert.stdout or "") + (recert.stderr or "")
-        summary_hit = _vm(
-            recert_node["ip"],
-            "sudo grep -a -q 'Expected exactly one node' /var/tmp/recert-out/summary.txt",
-            identity, check=False)
-        _vm(recert_node["ip"], "sudo chmod 600 /var/tmp/recert-out/summary.txt || true", identity, check=False)
-        expected = heal["recert_once"]["expected_error"] in combined or summary_hit.returncode == 0
-        _clone_log(work, f"recert exit {recert.returncode} expected_single_node_error={expected}")
-        if recert.returncode != 0 and not expected:
-            sys.exit(
-                f"Recert failed (exit {recert.returncode}) without the expected single-node message. "
-                f"It was not run again. Log: {work}/clone.log")
-        _vm(recert_node["ip"], "sudo podman rm -f etcd-proxy >/dev/null 2>&1 || true", identity, check=False)
-        _clone_log(work, "Recert finished once; copying quorum etcd certificates back to master-0-0")
-        quorum = by_role[QUORUM_ETCD_ROLE]
-        env.run(
-            "umask 077 && ssh " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} core@{quorum['ip']} "
-            "'sudo tar -C /etc/kubernetes/static-pod-resources -cf - etcd-certs' "
-            f"> {shlex.quote(work + '/etcd-certs-quorum.tar')}")
-        env.run(
-            "umask 077 && ssh " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} core@{recert_node['ip']} "
-            "'sudo tar -C /etc/kubernetes/static-pod-resources -cf - etcd-certs' "
-            f"> {shlex.quote(work + '/etcd-certs-node0-recert.tar')}")
-        env.run(
-            f"chmod 600 {shlex.quote(work + '/etcd-certs-quorum.tar')} "
-            f"{shlex.quote(work + '/etcd-certs-node0-recert.tar')}")
-        env.run(
-            "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
-            f"{shlex.quote(work + '/etcd-certs-quorum.tar')} core@{recert_node['ip']}:/var/tmp/etcd-certs-quorum.tar")
-        _vm(recert_node["ip"],
-            "sudo tar -C /etc/kubernetes/static-pod-resources -xf /var/tmp/etcd-certs-quorum.tar && "
-            "sudo restorecon -R /etc/kubernetes/static-pod-resources/etcd-certs || true",
-            identity)
-        _clone_log(work, "restore the original etcd trust onto the Recert apiserver")
-        env.run(
-            "umask 077 && ssh " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} core@{quorum['ip']} "
-            f"{shlex.quote(compact_apiserver_etcd_trust_tar_command())} "
-            f"> {shlex.quote(work + '/apiserver-etcd-trust.tar')}")
-        env.run(f"chmod 600 {shlex.quote(work + '/apiserver-etcd-trust.tar')}")
-        env.run(
-            "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
-            f"{shlex.quote(work + '/apiserver-etcd-trust.tar')} "
-            f"core@{recert_node['ip']}:/var/tmp/apiserver-etcd-trust.tar")
-        _vm(recert_node["ip"],
-            "sudo tar -C / -xf /var/tmp/apiserver-etcd-trust.tar && "
-            "sudo restorecon -R /etc/kubernetes/static-pod-resources || true",
-            identity)
-        _clone_log(work, "restore quorum client CA and service-account keys onto master-0-0")
-        env.run(
-            "umask 077 && ssh " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} core@{quorum['ip']} "
-            f"{shlex.quote(compact_apiserver_client_trust_tar_command())} "
-            f"> {shlex.quote(work + '/apiserver-client-trust.tar')}")
-        env.run(f"chmod 600 {shlex.quote(work + '/apiserver-client-trust.tar')}")
-        env.run(
-            "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
-            f"{shlex.quote(work + '/apiserver-client-trust.tar')} "
-            f"core@{recert_node['ip']}:/var/tmp/apiserver-client-trust.tar")
-        _vm(recert_node["ip"],
-            "sudo tar -C / -xf /var/tmp/apiserver-client-trust.tar && "
-            "sudo restorecon -R /etc/kubernetes/static-pod-resources || true",
-            identity)
-        quorum_digest = _vm(quorum["ip"], compact_client_trust_digest_command(), identity, check=False)
-        recert_digest = _vm(recert_node["ip"], compact_client_trust_digest_command(), identity, check=False)
-        if (quorum_digest.returncode != 0 or recert_digest.returncode != 0
-                or quorum_digest.stdout != recert_digest.stdout):
-            sys.exit(
-                "master-0-0 client CA, aggregator client, or service-account keys still differ from master-0-1. "
-                f"Log: {work}/clone.log")
-        _clone_log(work, "start kubelet on master-0-0 so it loads the quorum client CA")
-        _vm(recert_node["ip"], compact_start_recert_node_script(), identity, check=False)
-        _wait_admin_auth(src_kc, recert_node)
-        early_oc = _oc(src_kc, f"https://{api_ip}:6443")
-        certs = _require_reissued_etcd_certs(early_oc, nodes, identity, work)
-        if _revision_int(certs.get("etcd_revision_baseline")):
-            etcd_revision_baseline = certs["etcd_revision_baseline"]
-            _store_revision_baseline(work, "etcd", etcd_revision_baseline)
-        _sync_requestheader_aggregator_ca(src_kc, api_ip, work, identity, quorum["ip"])
+@dataclass(frozen=True)
+class CompactCloneContext:
+    source: dict
+    clone_id: str
+    nodes: list
+    identity: str
+    work: str
+    crypto: str
+    etcd_image: str
+    ingress_cn: str
+    plan_path: str
+    src_kc: str
+    pairs: list
+    pull_secret: str = None
 
-        _clone_log(work, "sign kubelet certificates with the live CSR signer")
-        clone_kc = f"{work}/clone.kubeconfig"
-        env.run(f"cp {shlex.quote(src_kc)} {shlex.quote(clone_kc)}")
-        clone_oc = _oc(clone_kc, f"https://{api_ip}:6443")
-        signer = f"{work}/csr-signer"
-        env.run(f"mkdir -p {shlex.quote(signer)} && chmod 700 {shlex.quote(signer)}")
-        _extract_secret(clone_oc, "openshift-kube-controller-manager-operator", "csr-signer", "tls.crt", f"{signer}/tls.crt")
-        _extract_secret(clone_oc, "openshift-kube-controller-manager-operator", "csr-signer", "tls.key", f"{signer}/tls.key")
-        for node in nodes:
-            script = kubelet_sign_script(node["role"], node["ip"], signer)
-            env.write_file(f"{work}/sign-{node['role']}.sh", script)
-            env.run(f"cd {shlex.quote(work)} && bash {shlex.quote('sign-' + node['role'] + '.sh')}")
-            env.run(
-                "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
-                f"{shlex.quote(work)}/{node['role']}-server.crt {shlex.quote(work)}/{node['role']}-server.key "
-                f"{shlex.quote(work)}/{node['role']}-client.crt {shlex.quote(work)}/{node['role']}-client.key "
-                f"core@{node['ip']}:/var/tmp/")
-            _vm(node["ip"], textwrap.dedent(f"""\
-                set -euo pipefail
-                sudo bash -c 'cat /var/tmp/{node['role']}-server.crt /var/tmp/{node['role']}-server.key > /var/lib/kubelet/pki/kubelet-server-current.pem'
-                sudo bash -c 'cat /var/tmp/{node['role']}-client.crt /var/tmp/{node['role']}-client.key > /var/lib/kubelet/pki/kubelet-client-current.pem'
-                sudo chmod 600 /var/lib/kubelet/pki/kubelet-server-current.pem /var/lib/kubelet/pki/kubelet-client-current.pem
-                sudo restorecon /var/lib/kubelet/pki/kubelet-server-current.pem /var/lib/kubelet/pki/kubelet-client-current.pem || true
-                """), identity)
-        _vm(quorum["ip"], "sudo cat /etc/kubernetes/kubelet-ca.crt", identity)
-        ca_copy = env.run(
-            "ssh " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} core@{quorum['ip']} "
-            "'sudo cat /etc/kubernetes/kubelet-ca.crt'")
-        env.write_file(f"{work}/kubelet-ca.crt", ca_copy.stdout)
+    @property
+    def by_role(self):
+        return {node["role"]: node for node in self.nodes}
+
+    @property
+    def api_ip(self):
+        return self.by_role[QUORUM_ETCD_ROLE]["ip"]
+
+    @property
+    def domain(self):
+        return f"test-infra-cluster-{self.clone_id}.redhat.com"
+
+    @property
+    def subnet(self):
+        return int(self.nodes[0]["ip"].split(".")[2])
+
+    @property
+    def api_vip(self):
+        return f"192.168.{self.subnet}.{COMPACT_API_SUFFIX}"
+
+
+def _run_compact_recert_phase(ctx):
+    """Run Recert once, restore quorum trust, and sign clone kubelet certificates."""
+    source = ctx.source
+    clone_id = ctx.clone_id
+    nodes = ctx.nodes
+    identity = ctx.identity
+    work = ctx.work
+    crypto = ctx.crypto
+    etcd_image = ctx.etcd_image
+    ingress_cn = ctx.ingress_cn
+    plan_path = ctx.plan_path
+    by_role = ctx.by_role
+    api_ip = ctx.api_ip
+    src_kc = ctx.src_kc
+    etcd_revision_baseline = None
+    _clone_log(work, "run Recert once on master-0-0")
+    recert_node = by_role[RECERT_ROLE]
+    _vm(recert_node["ip"], compact_stop_workloads_script(), identity)
+    _vm(recert_node["ip"], compact_stash_historical_certs_script(), identity)
+    peers = [by_role[role]["ip"] for role in COMPACT_ROLES if role != RECERT_ROLE]
+    _vm(recert_node["ip"], "sudo podman rm -f etcd-proxy recert >/dev/null 2>&1 || true", identity, check=False)
+    _vm(recert_node["ip"], "sudo mkdir -p /var/tmp/recert-crypto /var/tmp/recert-out && sudo chown core:core /var/tmp/recert-crypto /var/tmp/recert-out", identity)
+    env.run(
+        "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
+        f"{shlex.quote(crypto)}/lb-signer.key {shlex.quote(crypto)}/localhost-signer.key "
+        f"{shlex.quote(crypto)}/service-network-signer.key {shlex.quote(crypto)}/ingress.key "
+        f"core@{recert_node['ip']}:/var/tmp/recert-crypto/")
+    _vm(recert_node["ip"], compact_proxy_command(etcd_image, peers), identity)
+    heal = compact_heal_plan(source, clone_id, nodes, "/tmp/crypto", ingress_cn, plan_path, "/tmp/crypto/csr-signer")
+    recert = _vm(recert_node["ip"], compact_recert_podman_command(heal["recert_once"]["argv"]), identity, check=False)
+    combined = (recert.stdout or "") + (recert.stderr or "")
+    summary_hit = _vm(
+        recert_node["ip"],
+        "sudo grep -a -q 'Expected exactly one node' /var/tmp/recert-out/summary.txt",
+        identity, check=False)
+    _vm(recert_node["ip"], "sudo chmod 600 /var/tmp/recert-out/summary.txt || true", identity, check=False)
+    expected = heal["recert_once"]["expected_error"] in combined or summary_hit.returncode == 0
+    _clone_log(work, f"recert exit {recert.returncode} expected_single_node_error={expected}")
+    if recert.returncode != 0 and not expected:
+        sys.exit(
+            f"Recert failed (exit {recert.returncode}) without the expected single-node message. "
+            f"It was not run again. Log: {work}/clone.log")
+    _vm(recert_node["ip"], "sudo podman rm -f etcd-proxy >/dev/null 2>&1 || true", identity, check=False)
+    _clone_log(work, "Recert finished once; copying quorum etcd certificates back to master-0-0")
+    quorum = by_role[QUORUM_ETCD_ROLE]
+    env.run(
+        "umask 077 && ssh " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} core@{quorum['ip']} "
+        "'sudo tar -C /etc/kubernetes/static-pod-resources -cf - etcd-certs' "
+        f"> {shlex.quote(work + '/etcd-certs-quorum.tar')}")
+    env.run(
+        "umask 077 && ssh " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} core@{recert_node['ip']} "
+        "'sudo tar -C /etc/kubernetes/static-pod-resources -cf - etcd-certs' "
+        f"> {shlex.quote(work + '/etcd-certs-node0-recert.tar')}")
+    env.run(
+        f"chmod 600 {shlex.quote(work + '/etcd-certs-quorum.tar')} "
+        f"{shlex.quote(work + '/etcd-certs-node0-recert.tar')}")
+    env.run(
+        "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
+        f"{shlex.quote(work + '/etcd-certs-quorum.tar')} core@{recert_node['ip']}:/var/tmp/etcd-certs-quorum.tar")
+    _vm(recert_node["ip"],
+        "sudo tar -C /etc/kubernetes/static-pod-resources -xf /var/tmp/etcd-certs-quorum.tar && "
+        "sudo restorecon -R /etc/kubernetes/static-pod-resources/etcd-certs || true",
+        identity)
+    _clone_log(work, "restore the original etcd trust onto the Recert apiserver")
+    env.run(
+        "umask 077 && ssh " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} core@{quorum['ip']} "
+        f"{shlex.quote(compact_apiserver_etcd_trust_tar_command())} "
+        f"> {shlex.quote(work + '/apiserver-etcd-trust.tar')}")
+    env.run(f"chmod 600 {shlex.quote(work + '/apiserver-etcd-trust.tar')}")
+    env.run(
+        "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
+        f"{shlex.quote(work + '/apiserver-etcd-trust.tar')} "
+        f"core@{recert_node['ip']}:/var/tmp/apiserver-etcd-trust.tar")
+    _vm(recert_node["ip"],
+        "sudo tar -C / -xf /var/tmp/apiserver-etcd-trust.tar && "
+        "sudo restorecon -R /etc/kubernetes/static-pod-resources || true",
+        identity)
+    _clone_log(work, "restore quorum client CA and service-account keys onto master-0-0")
+    env.run(
+        "umask 077 && ssh " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} core@{quorum['ip']} "
+        f"{shlex.quote(compact_apiserver_client_trust_tar_command())} "
+        f"> {shlex.quote(work + '/apiserver-client-trust.tar')}")
+    env.run(f"chmod 600 {shlex.quote(work + '/apiserver-client-trust.tar')}")
+    env.run(
+        "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
+        f"{shlex.quote(work + '/apiserver-client-trust.tar')} "
+        f"core@{recert_node['ip']}:/var/tmp/apiserver-client-trust.tar")
+    _vm(recert_node["ip"],
+        "sudo tar -C / -xf /var/tmp/apiserver-client-trust.tar && "
+        "sudo restorecon -R /etc/kubernetes/static-pod-resources || true",
+        identity)
+    quorum_digest = _vm(quorum["ip"], compact_client_trust_digest_command(), identity, check=False)
+    recert_digest = _vm(recert_node["ip"], compact_client_trust_digest_command(), identity, check=False)
+    if (quorum_digest.returncode != 0 or recert_digest.returncode != 0
+            or quorum_digest.stdout != recert_digest.stdout):
+        sys.exit(
+            "master-0-0 client CA, aggregator client, or service-account keys still differ from master-0-1. "
+            f"Log: {work}/clone.log")
+    _clone_log(work, "start kubelet on master-0-0 so it loads the quorum client CA")
+    _vm(recert_node["ip"], compact_start_recert_node_script(), identity, check=False)
+    _wait_admin_auth(src_kc, recert_node)
+    early_oc = _oc(src_kc, f"https://{api_ip}:6443")
+    certs = _require_reissued_etcd_certs(early_oc, nodes, identity, work)
+    if _revision_int(certs.get("etcd_revision_baseline")):
+        etcd_revision_baseline = certs["etcd_revision_baseline"]
+        _store_revision_baseline(work, "etcd", etcd_revision_baseline)
+    _sync_requestheader_aggregator_ca(src_kc, api_ip, work, identity, quorum["ip"])
+
+    _clone_log(work, "sign kubelet certificates with the live CSR signer")
+    clone_kc = f"{work}/clone.kubeconfig"
+    env.run(f"cp {shlex.quote(src_kc)} {shlex.quote(clone_kc)}")
+    clone_oc = _oc(clone_kc, f"https://{api_ip}:6443")
+    signer = f"{work}/csr-signer"
+    env.run(f"mkdir -p {shlex.quote(signer)} && chmod 700 {shlex.quote(signer)}")
+    _extract_secret(clone_oc, "openshift-kube-controller-manager-operator", "csr-signer", "tls.crt", f"{signer}/tls.crt")
+    _extract_secret(clone_oc, "openshift-kube-controller-manager-operator", "csr-signer", "tls.key", f"{signer}/tls.key")
+    for node in nodes:
+        script = kubelet_sign_script(node["role"], node["ip"], signer)
+        env.write_file(f"{work}/sign-{node['role']}.sh", script)
+        env.run(f"cd {shlex.quote(work)} && bash {shlex.quote('sign-' + node['role'] + '.sh')}")
         env.run(
             "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
-            f"{shlex.quote(work + '/kubelet-ca.crt')} core@{recert_node['ip']}:/var/tmp/kubelet-ca.crt")
-        _vm(recert_node["ip"],
-            "sudo cp /var/tmp/kubelet-ca.crt /etc/kubernetes/kubelet-ca.crt && sudo restorecon /etc/kubernetes/kubelet-ca.crt || true",
-            identity)
-        # master-0-0 was started before its freshly signed client certificate
-        # was installed. Force kubelet to reload that file so it can register
-        # and make the MCO daemonset available before the render handoff.
-        _clone_log(work, "restart master-0-0 kubelet after installing its clone client certificate")
-        _vm(recert_node["ip"], "sudo systemctl restart kubelet", identity)
-        kubelet_ready = env.run(
-            f"{clone_oc} wait --for=condition=Ready node/{shlex.quote(recert_node['role'])} "
-            "--timeout=120s", check=False)
-        if kubelet_ready.returncode != 0:
-            detail = (kubelet_ready.stderr or kubelet_ready.stdout or "").strip()
+            f"{shlex.quote(work)}/{node['role']}-server.crt {shlex.quote(work)}/{node['role']}-server.key "
+            f"{shlex.quote(work)}/{node['role']}-client.crt {shlex.quote(work)}/{node['role']}-client.key "
+            f"core@{node['ip']}:/var/tmp/")
+        _vm(node["ip"], textwrap.dedent(f"""\
+            set -euo pipefail
+            sudo bash -c 'cat /var/tmp/{node['role']}-server.crt /var/tmp/{node['role']}-server.key > /var/lib/kubelet/pki/kubelet-server-current.pem'
+            sudo bash -c 'cat /var/tmp/{node['role']}-client.crt /var/tmp/{node['role']}-client.key > /var/lib/kubelet/pki/kubelet-client-current.pem'
+            sudo chmod 600 /var/lib/kubelet/pki/kubelet-server-current.pem /var/lib/kubelet/pki/kubelet-client-current.pem
+            sudo restorecon /var/lib/kubelet/pki/kubelet-server-current.pem /var/lib/kubelet/pki/kubelet-client-current.pem || true
+            """), identity)
+    _vm(quorum["ip"], "sudo cat /etc/kubernetes/kubelet-ca.crt", identity)
+    ca_copy = env.run(
+        "ssh " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} core@{quorum['ip']} "
+        "'sudo cat /etc/kubernetes/kubelet-ca.crt'")
+    env.write_file(f"{work}/kubelet-ca.crt", ca_copy.stdout)
+    env.run(
+        "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
+        f"{shlex.quote(work + '/kubelet-ca.crt')} core@{recert_node['ip']}:/var/tmp/kubelet-ca.crt")
+    _vm(recert_node["ip"],
+        "sudo cp /var/tmp/kubelet-ca.crt /etc/kubernetes/kubelet-ca.crt && sudo restorecon /etc/kubernetes/kubelet-ca.crt || true",
+        identity)
+    # master-0-0 was started before its freshly signed client certificate
+    # was installed. Force kubelet to reload that file so it can register
+    # and make the MCO daemonset available before the render handoff.
+    _clone_log(work, "restart master-0-0 kubelet after installing its clone client certificate")
+    _vm(recert_node["ip"], "sudo systemctl restart kubelet", identity)
+    kubelet_ready = env.run(
+        f"{clone_oc} wait --for=condition=Ready node/{shlex.quote(recert_node['role'])} "
+        "--timeout=120s", check=False)
+    if kubelet_ready.returncode != 0:
+        detail = (kubelet_ready.stderr or kubelet_ready.stdout or "").strip()
+        sys.exit(
+            "master-0-0 did not return Ready after its kubelet certificate reload"
+            + (f": {detail}" if detail else "")
+            + f". Log: {work}/clone.log")
+    _clone_log(work, "master-0-0 kubelet is Ready with the clone client certificate")
+
+    return etcd_revision_baseline
+
+
+def _apply_compact_identity_phase(ctx, clone_oc):
+    """Rewrite clone identity, prepare the master render, and hand it to MCD."""
+    clone_id = ctx.clone_id
+    nodes = ctx.nodes
+    identity = ctx.identity
+    work = ctx.work
+    etcd_image = ctx.etcd_image
+    pairs = ctx.pairs
+    pull_secret = ctx.pull_secret
+    api_ip = ctx.api_ip
+    domain = ctx.domain
+    subnet = ctx.subnet
+    _clone_log(work, "rewrite cluster records and 00-master")
+    previous_mcp = env.run(f"{clone_oc} get mcp master -o json", check=False)
+    if previous_mcp.returncode != 0 or not (previous_mcp.stdout or "").strip():
+        sys.exit(f"Could not read the master MachineConfigPool before the clone rewrite. Log: {work}/clone.log")
+    try:
+        previous_mcp_doc = json.loads(previous_mcp.stdout)
+    except json.JSONDecodeError:
+        sys.exit(f"The master MachineConfigPool response was invalid JSON. Log: {work}/clone.log")
+    previous_render = ((previous_mcp_doc.get("status") or {}).get("configuration") or {}).get("name", "")
+    previous_desired_render = ((previous_mcp_doc.get("spec") or {}).get("configuration") or {}).get("name", "")
+    if not previous_render or not previous_desired_render:
+        sys.exit(f"Could not read the current master render before the clone rewrite. Log: {work}/clone.log")
+
+    # Infrastructure is the source for the MCO ControllerConfig and its
+    # generated 00-master. Updating 00-master first is not durable: the MCO
+    # recreates it from ControllerConfig, which can still contain the flavor
+    # identity. Seed and verify those inputs before waiting for a render.
+    spec, status = compact_infrastructure_patches(clone_id, subnet)
+    for subresource, body in (("", spec), (" --subresource=status", status)):
+        patched = env.run(
+            f"{clone_oc} patch infrastructure cluster{subresource} --type=merge "
+            f"-p {shlex.quote(json.dumps(body))}", check=False)
+        if patched.returncode != 0:
+            detail = (patched.stderr or "").strip()
             sys.exit(
-                "master-0-0 did not return Ready after its kubelet certificate reload"
+                "Could not apply clone Infrastructure identity before MCO render"
                 + (f": {detail}" if detail else "")
                 + f". Log: {work}/clone.log")
-        _clone_log(work, "master-0-0 kubelet is Ready with the clone client certificate")
-
-    clone_kc = f"{work}/clone.kubeconfig"
-    if "yes" not in env.run(f"test -f {shlex.quote(clone_kc)} && echo yes || true").stdout:
-        env.run(f"cp {shlex.quote(src_kc)} {shlex.quote(clone_kc)}")
-    compact_configure_runner_kubeconfig(clone_kc, api_vip, f"api.{domain}")
-    clone_oc = _oc(clone_kc, f"https://{api_ip}:6443")
-    _clear_expired_mco_controller_lease(clone_oc, work)
-    _clone_log(
-        work,
-        f"prepared runner kubeconfig {clone_kc} server=https://{api_vip}:6443 "
-        f"tls-server-name=api.{domain}")
-    if start_at != "health":
-        apiserver_revision_baseline = _load_revision_baseline(work, "kube-apiserver")
-        if start_at == "rewrite" and not _revision_int(apiserver_revision_baseline):
-            sys.exit(
-                "Cannot safely resume the rewrite without the saved pre-refresh "
-                "kube-apiserver revision baseline. Restore it from the flavor snapshot "
-                f"before retrying. Log: {work}/clone.log")
-        if start_at is None and not _revision_int(apiserver_revision_baseline):
-            apiserver_revision_baseline = _operator_latest_revision(
-                clone_oc, "kube-apiserver")
-            if not _revision_int(apiserver_revision_baseline):
-                sys.exit(
-                    "kube-apiserver revision baseline is unavailable before "
-                    "certificate refresh; refusing to continue. "
-                    f"Log: {work}/clone.log")
-            _store_revision_baseline(work, "kube-apiserver", apiserver_revision_baseline)
-            _clone_log(
-                work,
-                f"saved pre-refresh kube-apiserver revision baseline "
-                f"{apiserver_revision_baseline}")
-    if start_at == "rewrite":
-        etcd_revision_baseline = _load_revision_baseline(work, "etcd")
-        if _revision_int(etcd_revision_baseline):
-            # A saved baseline means the first pass already verified the
-            # reissued certificate inputs and triggered the etcd rollout.
-            # Reapplying them on resume can create another revision while the
-            # previous one is still converging.
-            _clone_log(
-                work,
-                "reusing saved etcd revision baseline "
-                f"{etcd_revision_baseline}; leaving the existing rollout untouched")
-        else:
-            certs = _require_reissued_etcd_certs(clone_oc, nodes, identity, work)
-            if _revision_int(certs.get("etcd_revision_baseline")):
-                etcd_revision_baseline = certs["etcd_revision_baseline"]
-                _store_revision_baseline(work, "etcd", etcd_revision_baseline)
-    if start_at != "health":
-        _clone_log(work, "rewrite cluster records and 00-master")
-        previous_mcp = env.run(f"{clone_oc} get mcp master -o json", check=False)
-        if previous_mcp.returncode != 0 or not (previous_mcp.stdout or "").strip():
-            sys.exit(f"Could not read the master MachineConfigPool before the clone rewrite. Log: {work}/clone.log")
-        try:
-            previous_mcp_doc = json.loads(previous_mcp.stdout)
-        except json.JSONDecodeError:
-            sys.exit(f"The master MachineConfigPool response was invalid JSON. Log: {work}/clone.log")
-        previous_render = ((previous_mcp_doc.get("status") or {}).get("configuration") or {}).get("name", "")
-        previous_desired_render = ((previous_mcp_doc.get("spec") or {}).get("configuration") or {}).get("name", "")
-        if not previous_render or not previous_desired_render:
-            sys.exit(f"Could not read the current master render before the clone rewrite. Log: {work}/clone.log")
-
-        # Infrastructure is the source for the MCO ControllerConfig and its
-        # generated 00-master. Updating 00-master first is not durable: the MCO
-        # recreates it from ControllerConfig, which can still contain the flavor
-        # identity. Seed and verify those inputs before waiting for a render.
-        spec, status = compact_infrastructure_patches(clone_id, subnet)
-        for subresource, body in (("", spec), (" --subresource=status", status)):
-            patched = env.run(
-                f"{clone_oc} patch infrastructure cluster{subresource} --type=merge "
-                f"-p {shlex.quote(json.dumps(body))}", check=False)
-            if patched.returncode != 0:
-                detail = (patched.stderr or "").strip()
-                sys.exit(
-                    "Could not apply clone Infrastructure identity before MCO render"
-                    + (f": {detail}" if detail else "")
-                    + f". Log: {work}/clone.log")
-        _clone_log(work, "publish clone node addresses before MCO render")
-        _publish_clone_addresses(clone_oc, nodes, pairs)
-        pre_render_endpoints = _refresh_compact_kubernetes_endpoints(clone_oc, nodes, work)
-        if pre_render_endpoints is not True:
-            _clone_log(
-                work,
-                "Kubernetes API endpoints did not stabilize before MCO render; "
-                "continuing because the direct node APIs remain available")
-
-        mc = env.run(f"{clone_oc} get machineconfig 00-master -o json", check=False)
-        if mc.returncode != 0 or not (mc.stdout or "").strip():
-            sys.exit(f"Could not read MachineConfig 00-master before the clone rewrite. Log: {work}/clone.log")
-        try:
-            mc_doc = json.loads(mc.stdout)
-        except json.JSONDecodeError:
-            sys.exit(f"MachineConfig 00-master was not valid JSON. Log: {work}/clone.log")
-        owner_refs = (mc_doc.get("metadata") or {}).get("ownerReferences") or []
-        controllerconfig_owned = any(
-            owner.get("kind") == "ControllerConfig" and owner.get("controller") is True
-            for owner in owner_refs)
-        existing_render_raw = ""
-        existing_render_matches = False
-        existing_render = env.run(
-            f"{clone_oc} get machineconfig {shlex.quote(previous_desired_render)} -o json",
-            check=False)
-        if existing_render.returncode == 0 and (existing_render.stdout or "").strip():
-            existing_render_raw = existing_render.stdout
-            existing_render_matches = compact_machineconfig_has_clone_identity(
-                existing_render_raw, domain)
-        if controllerconfig_owned:
-            _clone_log(
-                work,
-                "00-master is ControllerConfig-managed; waiting for MCO-generated clone identity")
-            reuse_existing_render = existing_render_matches
-        else:
-            rewritten_mc = rewrite_machineconfig(mc.stdout, pairs)
-            rewritten_doc = json.loads(rewritten_mc)
-            machineconfig_spec_changed = mc_doc.get("spec") != rewritten_doc.get("spec")
-            rewritten_mc = compact_ensure_machineconfig_render_change(
-                mc.stdout, rewritten_mc, domain,
-                existing_render_raw=existing_render_raw if existing_render_matches else None)
-            env.write_file(f"{work}/00-master.json", rewritten_mc)
-            replaced = env.run(
-                f"{clone_oc} replace -f {shlex.quote(work + '/00-master.json')}", check=False)
-            if replaced.returncode != 0:
-                detail = (replaced.stderr or "").strip()
-                sys.exit(f"Could not update MachineConfig 00-master: {detail}. Log: {work}/clone.log")
-            reuse_existing_render = not machineconfig_spec_changed and existing_render_matches
-
-        def apply_identity_records():
-            def rewrite_object(item):
-                kind, namespace, name = item
-                raw = env.run(f"{clone_oc} get {kind} {name} -n {namespace} -o json", check=False)
-                if raw.returncode != 0:
-                    _clone_log(work, f"skip missing {kind} {namespace}/{name}")
-                    return
-                updated = rewrite_configmap(raw.stdout, pairs) if kind == "configmap" else apply_identity(raw.stdout, pairs)
-                dest = f"{work}/{kind}-{name}.json"
-                env.write_file(dest, updated)
-                env.run(f"{clone_oc} replace -f {shlex.quote(dest)}", check=False)
-
-            _in_parallel(list(HEAL_API_OBJECTS), rewrite_object)
-            spec, status = compact_infrastructure_patches(clone_id, subnet)
-            env.run(
-                f"{clone_oc} patch infrastructure cluster --type=merge -p {shlex.quote(json.dumps(spec))}",
-                check=False)
-            env.run(
-                f"{clone_oc} patch infrastructure cluster --subresource=status --type=merge "
-                f"-p {shlex.quote(json.dumps(status))}",
-                check=False)
-
-            def rewrite_cm(item):
-                namespace, name = item
-                raw = env.run(
-                    f"{clone_oc} get cm {shlex.quote(name)} -n {shlex.quote(namespace)} -o json",
-                    check=False)
-                if raw.returncode != 0 or not raw.stdout.strip():
-                    _clone_log(work, f"skip missing configmap {namespace}/{name}")
-                    return
-                dest = f"{work}/cm-{namespace}-{name}.json"
-                env.write_file(dest, rewrite_configmap(raw.stdout, pairs))
-                env.run(f"{clone_oc} replace -f {shlex.quote(dest)}", check=False)
-
-            _in_parallel(compact_identity_configmaps(clone_oc), rewrite_cm)
-            _clone_log(work, "point aggregated apiservers at the clone etcd")
-            for namespace, name in HEAL_ETCD_DEPLOYMENTS:
-                raw = env.run(
-                    f"{clone_oc} get deploy {shlex.quote(name)} -n {shlex.quote(namespace)} -o json",
-                    check=False)
-                if raw.returncode != 0 or not raw.stdout.strip():
-                    _clone_log(work, f"skip missing deployment {namespace}/{name}")
-                    continue
-                dest = f"{work}/deploy-{namespace}-{name}.json"
-                env.write_file(dest, rewrite_deployment(raw.stdout, pairs))
-                env.run(f"{clone_oc} replace -f {shlex.quote(dest)}", check=False)
-            for namespace in ("openshift-apiserver", "openshift-oauth-apiserver"):
-                env.run(
-                    f"{clone_oc} delete pod -n {shlex.quote(namespace)} --all --force --grace-period=0",
-                    check=False)
-            identity_domains = compact_identity_domain_patches(clone_id)
-            env.run(
-                f"{clone_oc} patch dns.config.openshift.io cluster --type=merge "
-                f"-p {shlex.quote(json.dumps(identity_domains['dns']))}",
-                check=False)
-            _clone_log(work, "set ingress spec.domain to the clone apps domain")
-            compact_apply_clone_ingress_domain(clone_oc, clone_id, work)
-            _sync_ingress_wildcard(clone_oc, clone_id, work)
-
-        # Let the API identity settle before replacing serving certificates. The
-        # pull secret is independent and can be staged alongside those changes.
-        preparation_steps = [("identity", apply_identity_records)]
-        if pull_secret is not None:
-            preparation_steps.append((
-                "pull-secret",
-                lambda: _inject_compact_pull_secret(clone_oc, work, pull_secret),
-            ))
-        _call_together(dict(preparation_steps))
-        # ControllerConfig embeds snapshots of both cluster-scoped identity
-        # resources. Sync it only after apply_identity_records has updated
-        # DNS/cluster; otherwise a fresh clone still has the source base domain
-        # and the guard correctly refuses to render.
-        _sync_compact_controllerconfig_identity(clone_oc, clone_id, subnet, work)
-
-        # Kubelets need the clone internal API certificate to reconnect. The
-        # cert-regeneration controller must also be restarted here, before MCO
-        # can render, because its process cached the source API identity at start.
-        _clone_log(work, "ensure clone API certificates while waiting for MCO render")
-
-        def resolve_master_render():
-            if controllerconfig_owned:
-                _wait_compact_machineconfig_source(clone_oc, clone_id, subnet, work)
-            if reuse_existing_render:
-                _clone_log(
-                    work,
-                    f"reusing clone-specific master render {previous_desired_render} on retry")
-                return previous_desired_render, existing_render_raw
-            rendered_name = _wait_master_render(
-                clone_oc, previous_desired_render, domain, work)
-            raw = env.run(
-                f"{clone_oc} get machineconfig {shlex.quote(rendered_name)} -o json", check=False)
-            if raw.returncode != 0 or not (raw.stdout or "").strip():
-                detail = (raw.stderr or "").strip()
-                sys.exit(
-                    f"Could not read the desired master render {rendered_name}: "
-                    f"{detail}. Log: {work}/clone.log")
-            return rendered_name, raw.stdout
-
-        parallel_results = _call_together({
-            "render": resolve_master_render,
-            "api-certificates": lambda: _recover_compact_api_certificates_and_endpoints(
-                clone_oc, work, domain, api_ip, nodes, identity, etcd_image),
-        })
-        rendered, raw_render_text = parallel_results["render"]
-        desired_master_render, expected_api_url = compact_machineconfig_identity(
-            raw_render_text, domain)
-        if desired_master_render != rendered:
-            sys.exit(
-                f"MCP returned render {rendered}, but the MachineConfig is "
-                f"{desired_master_render}. Log: {work}/clone.log")
-        env.write_file(f"{work}/currentconfig.json", raw_render_text)
-        heal_files = {
-            path: body for path, body in rendered_machineconfig_files(raw_render_text).items()
-            if path in HEAL_NODE_FILES
-        }
-        if heal_files.get("/etc/kubernetes/apiserver-url.env") != expected_api_url:
-            sys.exit("The desired render is missing the clone API URL file")
-        env.write_file(f"{work}/heal-files.json", json.dumps(heal_files))
-        env.write_file(f"{work}/apply-heal-files.py", textwrap.dedent("""\
-            import json
-            import pathlib
-
-            render = json.load(open("/var/tmp/currentconfig.json"))
-            target = render.get("metadata", {}).get("name")
-            current = json.load(open("/etc/machine-config-daemon/currentconfig"))
-            if not target or current.get("metadata", {}).get("name") != target:
-                raise SystemExit("currentconfig does not match the desired render")
-            files = json.load(open("/var/tmp/heal-files.json"))
-            for path, body in files.items():
-                pathlib.Path(path).write_text(body)
-            for path, body in files.items():
-                candidate = pathlib.Path(path)
-                if not candidate.is_file() or candidate.read_text() != body:
-                    raise SystemExit("rendered file verification failed: " + path)
-            """))
-        _clone_log(work, "install and verify clone render files before MCD handoff")
-
-        def install_render(node):
-            env.run(
-                "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
-                f"{shlex.quote(work + '/currentconfig.json')} {shlex.quote(work + '/heal-files.json')} "
-                f"{shlex.quote(work + '/apply-heal-files.py')} "
-                f"core@{node['ip']}:/var/tmp/")
-            _vm(node["ip"], textwrap.dedent("""\
-                set -euo pipefail
-                sudo cp /var/tmp/currentconfig.json /etc/machine-config-daemon/currentconfig
-                sudo restorecon /etc/machine-config-daemon/currentconfig || true
-                sudo python3 /var/tmp/apply-heal-files.py
-                """), identity)
-
-        _in_parallel(nodes, install_render)
-        node_names = " ".join(shlex.quote(node["role"]) for node in nodes)
-        env.run(
-            f"{clone_oc} annotate node {node_names} "
-            f"machineconfiguration.openshift.io/desiredConfig={shlex.quote(rendered)} "
-            f"machineconfiguration.openshift.io/currentConfig={shlex.quote(rendered)} "
-            "machineconfiguration.openshift.io/state=Done --overwrite")
-        env.run(f"{clone_oc} adm uncordon {node_names}")
-    elif pull_secret is not None:
-        _inject_compact_pull_secret(clone_oc, work, pull_secret)
-        _ensure_api_certificates(clone_oc, work, domain, api_vip, nodes, identity)
-
-    if start_at != "health" or pull_secret is not None:
-        _clone_log(work, "rewrite etcd pod manifests laid down by the operator")
-        env.write_file(f"{work}/identity-pairs.json", json.dumps(pairs))
-        env.write_file(f"{work}/rewrite-identity.py", compact_identity_script())
-
-        def rewrite_node(node):
-            env.run(
-                "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
-                f"{shlex.quote(work + '/identity-pairs.json')} {shlex.quote(work + '/rewrite-identity.py')} "
-                f"core@{node['ip']}:/var/tmp/")
-            _vm(node["ip"], "sudo python3 /var/tmp/rewrite-identity.py", identity, check=False)
-
-        _in_parallel(nodes, rewrite_node)
-        _clone_log(work, "publish clone node IPs without restarting kubelet")
-        _publish_clone_addresses(clone_oc, nodes, pairs)
-
-        def refresh_node_address(node):
-            _vm(node["ip"], "sudo podman rm -f etcd-proxy >/dev/null 2>&1 || true; sudo systemctl stop chrony-wait.service || true", identity, check=False)
-            _vm(node["ip"], compact_release_keepalived_script(), identity, check=False)
-
-        _in_parallel(nodes, refresh_node_address)
-        apiserver_revision_baseline = _load_revision_baseline(work, "kube-apiserver")
-        if not _revision_int(apiserver_revision_baseline):
-            sys.exit(
-                "Saved kube-apiserver revision baseline is unavailable before "
-                f"certificate refresh. Log: {work}/clone.log")
+    _clone_log(work, "publish clone node addresses before MCO render")
+    _publish_clone_addresses(clone_oc, nodes, pairs)
+    pre_render_endpoints = _refresh_compact_kubernetes_endpoints(clone_oc, nodes, work)
+    if pre_render_endpoints is not True:
         _clone_log(
             work,
-            f"using pre-refresh kube-apiserver revision baseline "
-            f"{apiserver_revision_baseline}")
-        _refresh_internal_api_certificate(clone_oc, work, domain, api_vip, nodes, identity)
-        _clone_log(work, "replace node identity and ovnkube pods that still use the source API")
-        _call_together({
-            "nni": lambda: env.run(
-                f"{clone_oc} delete pod -n openshift-network-node-identity --all --force --grace-period=0",
-                check=False),
-            "ovn": lambda: env.run(
-                f"{clone_oc} delete pod -n openshift-ovn-kubernetes -l app=ovnkube-node --force --grace-period=0",
-                check=False),
-        })
+            "Kubernetes API endpoints did not stabilize before MCO render; "
+            "continuing because the direct node APIs remain available")
 
-    if not _refresh_compact_kubernetes_endpoints(clone_oc, nodes, work):
-        sys.exit(
-            "Could not converge Kubernetes service endpoints on clone API addresses. "
-            f"Log: {work}/clone.log")
+    mc = env.run(f"{clone_oc} get machineconfig 00-master -o json", check=False)
+    if mc.returncode != 0 or not (mc.stdout or "").strip():
+        sys.exit(f"Could not read MachineConfig 00-master before the clone rewrite. Log: {work}/clone.log")
+    try:
+        mc_doc = json.loads(mc.stdout)
+    except json.JSONDecodeError:
+        sys.exit(f"MachineConfig 00-master was not valid JSON. Log: {work}/clone.log")
+    owner_refs = (mc_doc.get("metadata") or {}).get("ownerReferences") or []
+    controllerconfig_owned = any(
+        owner.get("kind") == "ControllerConfig" and owner.get("controller") is True
+        for owner in owner_refs)
+    existing_render_raw = ""
+    existing_render_matches = False
+    existing_render = env.run(
+        f"{clone_oc} get machineconfig {shlex.quote(previous_desired_render)} -o json",
+        check=False)
+    if existing_render.returncode == 0 and (existing_render.stdout or "").strip():
+        existing_render_raw = existing_render.stdout
+        existing_render_matches = compact_machineconfig_has_clone_identity(
+            existing_render_raw, domain)
+    if controllerconfig_owned:
+        _clone_log(
+            work,
+            "00-master is ControllerConfig-managed; waiting for MCO-generated clone identity")
+        reuse_existing_render = existing_render_matches
+    else:
+        rewritten_mc = rewrite_machineconfig(mc.stdout, pairs)
+        rewritten_doc = json.loads(rewritten_mc)
+        machineconfig_spec_changed = mc_doc.get("spec") != rewritten_doc.get("spec")
+        rewritten_mc = compact_ensure_machineconfig_render_change(
+            mc.stdout, rewritten_mc, domain,
+            existing_render_raw=existing_render_raw if existing_render_matches else None)
+        env.write_file(f"{work}/00-master.json", rewritten_mc)
+        replaced = env.run(
+            f"{clone_oc} replace -f {shlex.quote(work + '/00-master.json')}", check=False)
+        if replaced.returncode != 0:
+            detail = (replaced.stderr or "").strip()
+            sys.exit(f"Could not update MachineConfig 00-master: {detail}. Log: {work}/clone.log")
+        reuse_existing_render = not machineconfig_spec_changed and existing_render_matches
 
-    if not _revision_int(etcd_revision_baseline) or not _revision_int(apiserver_revision_baseline):
+    def apply_identity_records():
+        def rewrite_object(item):
+            kind, namespace, name = item
+            raw = env.run(f"{clone_oc} get {kind} {name} -n {namespace} -o json", check=False)
+            if raw.returncode != 0:
+                _clone_log(work, f"skip missing {kind} {namespace}/{name}")
+                return
+            updated = rewrite_configmap(raw.stdout, pairs) if kind == "configmap" else apply_identity(raw.stdout, pairs)
+            dest = f"{work}/{kind}-{name}.json"
+            env.write_file(dest, updated)
+            env.run(f"{clone_oc} replace -f {shlex.quote(dest)}", check=False)
+
+        _in_parallel(list(HEAL_API_OBJECTS), rewrite_object)
+        spec, status = compact_infrastructure_patches(clone_id, subnet)
+        env.run(
+            f"{clone_oc} patch infrastructure cluster --type=merge -p {shlex.quote(json.dumps(spec))}",
+            check=False)
+        env.run(
+            f"{clone_oc} patch infrastructure cluster --subresource=status --type=merge "
+            f"-p {shlex.quote(json.dumps(status))}",
+            check=False)
+
+        def rewrite_cm(item):
+            namespace, name = item
+            raw = env.run(
+                f"{clone_oc} get cm {shlex.quote(name)} -n {shlex.quote(namespace)} -o json",
+                check=False)
+            if raw.returncode != 0 or not raw.stdout.strip():
+                _clone_log(work, f"skip missing configmap {namespace}/{name}")
+                return
+            dest = f"{work}/cm-{namespace}-{name}.json"
+            env.write_file(dest, rewrite_configmap(raw.stdout, pairs))
+            env.run(f"{clone_oc} replace -f {shlex.quote(dest)}", check=False)
+
+        _in_parallel(compact_identity_configmaps(clone_oc), rewrite_cm)
+        _clone_log(work, "point aggregated apiservers at the clone etcd")
+        for namespace, name in HEAL_ETCD_DEPLOYMENTS:
+            raw = env.run(
+                f"{clone_oc} get deploy {shlex.quote(name)} -n {shlex.quote(namespace)} -o json",
+                check=False)
+            if raw.returncode != 0 or not raw.stdout.strip():
+                _clone_log(work, f"skip missing deployment {namespace}/{name}")
+                continue
+            dest = f"{work}/deploy-{namespace}-{name}.json"
+            env.write_file(dest, rewrite_deployment(raw.stdout, pairs))
+            env.run(f"{clone_oc} replace -f {shlex.quote(dest)}", check=False)
+        for namespace in ("openshift-apiserver", "openshift-oauth-apiserver"):
+            env.run(
+                f"{clone_oc} delete pod -n {shlex.quote(namespace)} --all --force --grace-period=0",
+                check=False)
+        identity_domains = compact_identity_domain_patches(clone_id)
+        env.run(
+            f"{clone_oc} patch dns.config.openshift.io cluster --type=merge "
+            f"-p {shlex.quote(json.dumps(identity_domains['dns']))}",
+            check=False)
+        _clone_log(work, "set ingress spec.domain to the clone apps domain")
+        compact_apply_clone_ingress_domain(clone_oc, clone_id, work)
+        _sync_ingress_wildcard(clone_oc, clone_id, work)
+
+    # Let the API identity settle before replacing serving certificates. The
+    # pull secret is independent and can be staged alongside those changes.
+    preparation_steps = [("identity", apply_identity_records)]
+    if pull_secret is not None:
+        preparation_steps.append((
+            "pull-secret",
+            lambda: _inject_compact_pull_secret(clone_oc, work, pull_secret),
+        ))
+    _call_together(dict(preparation_steps))
+    # ControllerConfig embeds snapshots of both cluster-scoped identity
+    # resources. Sync it only after apply_identity_records has updated
+    # DNS/cluster; otherwise a fresh clone still has the source base domain
+    # and the guard correctly refuses to render.
+    _sync_compact_controllerconfig_identity(clone_oc, clone_id, subnet, work)
+
+    # Kubelets need the clone internal API certificate to reconnect. The
+    # cert-regeneration controller must also be restarted here, before MCO
+    # can render, because its process cached the source API identity at start.
+    _clone_log(work, "ensure clone API certificates while waiting for MCO render")
+
+    def resolve_master_render():
+        if controllerconfig_owned:
+            _wait_compact_machineconfig_source(clone_oc, clone_id, subnet, work)
+        if reuse_existing_render:
+            _clone_log(
+                work,
+                f"reusing clone-specific master render {previous_desired_render} on retry")
+            return previous_desired_render, existing_render_raw
+        rendered_name = _wait_master_render(
+            clone_oc, previous_desired_render, domain, work)
+        raw = env.run(
+            f"{clone_oc} get machineconfig {shlex.quote(rendered_name)} -o json", check=False)
+        if raw.returncode != 0 or not (raw.stdout or "").strip():
+            detail = (raw.stderr or "").strip()
+            sys.exit(
+                f"Could not read the desired master render {rendered_name}: "
+                f"{detail}. Log: {work}/clone.log")
+        return rendered_name, raw.stdout
+
+    parallel_results = _call_together({
+        "render": resolve_master_render,
+        "api-certificates": lambda: _recover_compact_api_certificates_and_endpoints(
+            clone_oc, work, domain, api_ip, nodes, identity, etcd_image),
+    })
+    rendered, raw_render_text = parallel_results["render"]
+    desired_master_render, expected_api_url = compact_machineconfig_identity(
+        raw_render_text, domain)
+    if desired_master_render != rendered:
         sys.exit(
-            "Refusing to wait for install revisions without an etcd baseline "
-            f"({etcd_revision_baseline}) and a kube-apiserver baseline "
-            f"({apiserver_revision_baseline}). Log: {work}/clone.log")
+            f"MCP returned render {rendered}, but the MachineConfig is "
+            f"{desired_master_render}. Log: {work}/clone.log")
+    env.write_file(f"{work}/currentconfig.json", raw_render_text)
+    heal_files = {
+        path: body for path, body in rendered_machineconfig_files(raw_render_text).items()
+        if path in HEAL_NODE_FILES
+    }
+    if heal_files.get("/etc/kubernetes/apiserver-url.env") != expected_api_url:
+        sys.exit("The desired render is missing the clone API URL file")
+    env.write_file(f"{work}/heal-files.json", json.dumps(heal_files))
+    env.write_file(f"{work}/apply-heal-files.py", textwrap.dedent("""\
+        import json
+        import pathlib
+
+        render = json.load(open("/var/tmp/currentconfig.json"))
+        target = render.get("metadata", {}).get("name")
+        current = json.load(open("/etc/machine-config-daemon/currentconfig"))
+        if not target or current.get("metadata", {}).get("name") != target:
+            raise SystemExit("currentconfig does not match the desired render")
+        files = json.load(open("/var/tmp/heal-files.json"))
+        for path, body in files.items():
+            pathlib.Path(path).write_text(body)
+        for path, body in files.items():
+            candidate = pathlib.Path(path)
+            if not candidate.is_file() or candidate.read_text() != body:
+                raise SystemExit("rendered file verification failed: " + path)
+        """))
+    _clone_log(work, "install and verify clone render files before MCD handoff")
+
+    def install_render(node):
+        env.run(
+            "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
+            f"{shlex.quote(work + '/currentconfig.json')} {shlex.quote(work + '/heal-files.json')} "
+            f"{shlex.quote(work + '/apply-heal-files.py')} "
+            f"core@{node['ip']}:/var/tmp/")
+        _vm(node["ip"], textwrap.dedent("""\
+            set -euo pipefail
+            sudo cp /var/tmp/currentconfig.json /etc/machine-config-daemon/currentconfig
+            sudo restorecon /etc/machine-config-daemon/currentconfig || true
+            sudo python3 /var/tmp/apply-heal-files.py
+            """), identity)
+
+    _in_parallel(nodes, install_render)
+    node_names = " ".join(shlex.quote(node["role"]) for node in nodes)
+    env.run(
+        f"{clone_oc} annotate node {node_names} "
+        f"machineconfiguration.openshift.io/desiredConfig={shlex.quote(rendered)} "
+        f"machineconfiguration.openshift.io/currentConfig={shlex.quote(rendered)} "
+        "machineconfiguration.openshift.io/state=Done --overwrite")
+    env.run(f"{clone_oc} adm uncordon {node_names}")
+    return desired_master_render, expected_api_url
+
+
+def _wait_compact_install_ready(
+    ctx, clone_oc, etcd_revision_baseline, apiserver_revision_baseline,
+    desired_master_render, expected_api_url,
+):
+    """Wait for node, operator, revision, and MachineConfig convergence."""
+    clone_id = ctx.clone_id
+    nodes = ctx.nodes
+    identity = ctx.identity
+    work = ctx.work
+    etcd_image = ctx.etcd_image
+    api_ip = ctx.api_ip
+    domain = ctx.domain
+    clone_kc = f"{work}/clone.kubeconfig"
     _clone_log(work, "wait until etcd and the API revisions are installed for vmaas")
     deadline = time.time() + 40 * 60
     last = None
@@ -5212,6 +5180,156 @@ def _finish_compact_clone(
         f"apiserver-url={','.join(last_api_url_blockers) or 'not-probed'}. "
         f"Log: {work}/clone.log")
 
+
+def _finish_compact_clone(ctx, start_at=None):
+    """Finish certificate heal, identity rewrite, and the compact health wait."""
+    nodes = ctx.nodes
+    identity = ctx.identity
+    work = ctx.work
+    etcd_image = ctx.etcd_image
+    api_ip = ctx.api_ip
+    src_kc = ctx.src_kc
+    pairs = ctx.pairs
+    pull_secret = ctx.pull_secret
+    etcd_revision_baseline = None
+    apiserver_revision_baseline = None
+    domain = ctx.domain
+    api_vip = ctx.api_vip
+    desired_master_render = ""
+    expected_api_url = ""
+    _clone_log(work, "remove stale source API-server leases from clone etcd")
+    _clear_compact_stale_master_leases(nodes, identity, etcd_image, work)
+    if start_at == "health":
+        loaded = _load_revision_baselines(work)
+        if loaded is None:
+            sys.exit(
+                "Refusing to resume the health check without saved etcd and "
+                f"kube-apiserver revision baselines. Log: {work}/clone.log")
+        etcd_revision_baseline, apiserver_revision_baseline = loaded
+        saved_render = env.run(f"cat {shlex.quote(work + '/currentconfig.json')}", check=False)
+        if saved_render.returncode != 0 or not (saved_render.stdout or "").strip():
+            sys.exit(
+                "Refusing to resume the health check without the desired master render. "
+                f"Log: {work}/clone.log")
+        desired_master_render, expected_api_url = compact_machineconfig_identity(
+            saved_render.stdout, domain)
+        _clone_log(
+            work,
+            "resume at the health check from etcd revision "
+            f"{etcd_revision_baseline} and kube-apiserver revision {apiserver_revision_baseline}")
+    elif start_at == "rewrite":
+        _clone_log(work, "resume after the Recert commit; rewriting cluster records")
+    else:
+        etcd_revision_baseline = _run_compact_recert_phase(ctx)
+    clone_kc = f"{work}/clone.kubeconfig"
+    if "yes" not in env.run(f"test -f {shlex.quote(clone_kc)} && echo yes || true").stdout:
+        env.run(f"cp {shlex.quote(src_kc)} {shlex.quote(clone_kc)}")
+    compact_configure_runner_kubeconfig(clone_kc, api_vip, f"api.{domain}")
+    clone_oc = _oc(clone_kc, f"https://{api_ip}:6443")
+    _clear_expired_mco_controller_lease(clone_oc, work)
+    _clone_log(
+        work,
+        f"prepared runner kubeconfig {clone_kc} server=https://{api_vip}:6443 "
+        f"tls-server-name=api.{domain}")
+    if start_at != "health":
+        apiserver_revision_baseline = _load_revision_baseline(work, "kube-apiserver")
+        if start_at == "rewrite" and not _revision_int(apiserver_revision_baseline):
+            sys.exit(
+                "Cannot safely resume the rewrite without the saved pre-refresh "
+                "kube-apiserver revision baseline. Restore it from the flavor snapshot "
+                f"before retrying. Log: {work}/clone.log")
+        if start_at is None and not _revision_int(apiserver_revision_baseline):
+            apiserver_revision_baseline = _operator_latest_revision(
+                clone_oc, "kube-apiserver")
+            if not _revision_int(apiserver_revision_baseline):
+                sys.exit(
+                    "kube-apiserver revision baseline is unavailable before "
+                    "certificate refresh; refusing to continue. "
+                    f"Log: {work}/clone.log")
+            _store_revision_baseline(work, "kube-apiserver", apiserver_revision_baseline)
+            _clone_log(
+                work,
+                f"saved pre-refresh kube-apiserver revision baseline "
+                f"{apiserver_revision_baseline}")
+    if start_at == "rewrite":
+        etcd_revision_baseline = _load_revision_baseline(work, "etcd")
+        if _revision_int(etcd_revision_baseline):
+            # A saved baseline means the first pass already verified the
+            # reissued certificate inputs and triggered the etcd rollout.
+            # Reapplying them on resume can create another revision while the
+            # previous one is still converging.
+            _clone_log(
+                work,
+                "reusing saved etcd revision baseline "
+                f"{etcd_revision_baseline}; leaving the existing rollout untouched")
+        else:
+            certs = _require_reissued_etcd_certs(clone_oc, nodes, identity, work)
+            if _revision_int(certs.get("etcd_revision_baseline")):
+                etcd_revision_baseline = certs["etcd_revision_baseline"]
+                _store_revision_baseline(work, "etcd", etcd_revision_baseline)
+    if start_at != "health":
+        desired_master_render, expected_api_url = _apply_compact_identity_phase(ctx, clone_oc)
+    elif pull_secret is not None:
+        _inject_compact_pull_secret(clone_oc, work, pull_secret)
+        _ensure_api_certificates(clone_oc, work, domain, api_vip, nodes, identity)
+
+    if start_at != "health" or pull_secret is not None:
+        _clone_log(work, "rewrite etcd pod manifests laid down by the operator")
+        env.write_file(f"{work}/identity-pairs.json", json.dumps(pairs))
+        env.write_file(f"{work}/rewrite-identity.py", compact_identity_script())
+
+        def rewrite_node(node):
+            env.run(
+                "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
+                f"{shlex.quote(work + '/identity-pairs.json')} {shlex.quote(work + '/rewrite-identity.py')} "
+                f"core@{node['ip']}:/var/tmp/")
+            _vm(node["ip"], "sudo python3 /var/tmp/rewrite-identity.py", identity, check=False)
+
+        _in_parallel(nodes, rewrite_node)
+        _clone_log(work, "publish clone node IPs without restarting kubelet")
+        _publish_clone_addresses(clone_oc, nodes, pairs)
+
+        def refresh_node_address(node):
+            _vm(node["ip"], "sudo podman rm -f etcd-proxy >/dev/null 2>&1 || true; sudo systemctl stop chrony-wait.service || true", identity, check=False)
+            _vm(node["ip"], compact_release_keepalived_script(), identity, check=False)
+
+        _in_parallel(nodes, refresh_node_address)
+        apiserver_revision_baseline = _load_revision_baseline(work, "kube-apiserver")
+        if not _revision_int(apiserver_revision_baseline):
+            sys.exit(
+                "Saved kube-apiserver revision baseline is unavailable before "
+                f"certificate refresh. Log: {work}/clone.log")
+        _clone_log(
+            work,
+            f"using pre-refresh kube-apiserver revision baseline "
+            f"{apiserver_revision_baseline}")
+        _refresh_internal_api_certificate(clone_oc, work, domain, api_vip, nodes, identity)
+        _clone_log(work, "replace node identity and ovnkube pods that still use the source API")
+        _call_together({
+            "nni": lambda: env.run(
+                f"{clone_oc} delete pod -n openshift-network-node-identity --all --force --grace-period=0",
+                check=False),
+            "ovn": lambda: env.run(
+                f"{clone_oc} delete pod -n openshift-ovn-kubernetes -l app=ovnkube-node --force --grace-period=0",
+                check=False),
+        })
+
+    if not _refresh_compact_kubernetes_endpoints(clone_oc, nodes, work):
+        sys.exit(
+            "Could not converge Kubernetes service endpoints on clone API addresses. "
+            f"Log: {work}/clone.log")
+
+    if not _revision_int(etcd_revision_baseline) or not _revision_int(apiserver_revision_baseline):
+        sys.exit(
+            "Refusing to wait for install revisions without an etcd baseline "
+            f"({etcd_revision_baseline}) and a kube-apiserver baseline "
+            f"({apiserver_revision_baseline}). Log: {work}/clone.log")
+    return _wait_compact_install_ready(
+        ctx, clone_oc, etcd_revision_baseline, apiserver_revision_baseline,
+        desired_master_render, expected_api_url,
+    )
+
+
 def _start_compact_clone(
     source, clone_id, subnet, nodes, macs, identity, work, crypto, etcd_image,
     ingress_cn, memory_kib, vcpus, skip_hash_check=False, pull_secret=None,
@@ -5323,9 +5441,12 @@ def _start_compact_clone(
     if not ready:
         sys.exit(f"Clone API on {api_ip}:6443 did not become ready. Log: {work}/clone.log")
 
-    return _finish_compact_clone(
-        source, clone_id, nodes, identity, work, crypto, etcd_image, ingress_cn,
-        plan_path, by_role, api_ip, src_kc, pairs, pull_secret=pull_secret)
+    context = CompactCloneContext(
+        source=source, clone_id=clone_id, nodes=nodes, identity=identity,
+        work=work, crypto=crypto, etcd_image=etcd_image, ingress_cn=ingress_cn,
+        plan_path=plan_path, src_kc=src_kc, pairs=pairs, pull_secret=pull_secret,
+    )
+    return _finish_compact_clone(context)
 
 
 RHCOS_ROOT_MOUNT = "/dev/sda4:/"
@@ -5509,7 +5630,7 @@ def run_compact_from_flavor(
             print(f"Allocated subnet {subnet} for clone {clone_id}", flush=True)
     env.run(f"mkdir -p {shlex.quote(work)} && chmod 755 {shlex.quote(work)}")
     _clone_log(work, f"read identity from flavor {flavor_name}")
-    env.write_file(f"{work}/source.kubeconfig", kubeconfig)
+    env.write_file(f"{work}/source.kubeconfig", kubeconfig, private=True)
     env.run(f"chmod 600 {shlex.quote(work + '/source.kubeconfig')}")
     nodes = compact_node_plan(clone_id, subnet, macs)
     for node in nodes:
@@ -5524,14 +5645,15 @@ def run_compact_from_flavor(
             identity = f"{crypto}/cluster-tool.key"
         env.run(f"test -s {shlex.quote(identity)}")
         pairs = compact_identity_pairs(source, clone_id, nodes)
-        by_role = {node["role"]: node for node in nodes}
-        api_ip = by_role[QUORUM_ETCD_ROLE]["ip"]
         _clone_log(work, f"resume at {resume}")
+        context = CompactCloneContext(
+            source=source, clone_id=clone_id, nodes=nodes, identity=identity,
+            work=work, crypto=crypto, etcd_image=flavor["etcd_image"],
+            ingress_cn=ingress_cn, plan_path="/out/summary.txt",
+            src_kc=f"{work}/source.kubeconfig", pairs=pairs, pull_secret=pull_secret,
+        )
         health = _finish_compact_clone(
-            source, clone_id, nodes, identity, work, crypto, flavor["etcd_image"], ingress_cn,
-            "/out/summary.txt", by_role, api_ip, f"{work}/source.kubeconfig", pairs,
-            start_at=None if resume == "recert" else resume,
-            pull_secret=pull_secret)
+            context, start_at=None if resume == "recert" else resume)
         mark_compact_clone_running(clone_id)
         return health
     flavor_crypto = flavor_crypto_dir(flavor_name)
@@ -5637,10 +5759,13 @@ def run_compact_clone(source, clone_id, subnet, identity, memory_kib=None, vcpus
         etcd_image = image_r.stdout.strip()
         pairs = compact_identity_pairs(source, clone_id, nodes)
         _clone_log(work, f"resume at {resume}")
+        context = CompactCloneContext(
+            source=source, clone_id=clone_id, nodes=nodes, identity=identity,
+            work=work, crypto=crypto, etcd_image=etcd_image, ingress_cn=ingress_cn,
+            plan_path=plan_path, src_kc=src_kc, pairs=pairs,
+        )
         health = _finish_compact_clone(
-            source, clone_id, nodes, identity, work, crypto, etcd_image, ingress_cn,
-            plan_path, by_role, api_ip, src_kc, pairs,
-            start_at={"heal": "rewrite", "health": "health"}.get(resume))
+            context, start_at={"heal": "rewrite", "health": "health"}.get(resume))
         mark_compact_clone_running(clone_id)
         return health
 
@@ -5652,7 +5777,7 @@ def run_compact_clone(source, clone_id, subnet, identity, memory_kib=None, vcpus
     src_pin = next(node["ip"] for node in source["nodes"] if node["role"] == QUORUM_ETCD_ROLE)
     src_kc = f"{work}/source.kubeconfig"
     env.run(
-        "ssh " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} core@{src_pin} "
+        "umask 077 && ssh " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} core@{src_pin} "
         "'sudo cat /etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig' "
         f"> {shlex.quote(src_kc)}")
     env.run(f"chmod 600 {shlex.quote(src_kc)}")
@@ -6205,24 +6330,32 @@ def gen_compact_network_xml(clone_id, subnet, nodes):
         </network>""")
 
 
-def gen_compact_vm_xml(clone_id, node, overlay_disks,
-                       memory_kib=67108864, vcpus=16,
-                       machine_type=DEFAULT_VM_MACHINE_TYPE, emulator=DEFAULT_VM_EMULATOR):
-    """Build libvirt domain XML for one compact guest."""
+def _gen_domain_xml(name, overlay_disks, disk_bus, interfaces,
+                    memory_kib, vcpus, machine_type, emulator):
+    """Render the VM shape shared by single-node and compact clones."""
     if isinstance(overlay_disks, str):
         overlay_disks = [overlay_disks]
+    device_prefix = "vd" if disk_bus == "virtio" else "sd"
     disk_xml = ""
-    for i, overlay in enumerate(overlay_disks):
-        dev = f"vd{chr(97 + i)}"
+    for index, overlay in enumerate(overlay_disks):
+        device = f"{device_prefix}{chr(97 + index)}"
         disk_xml += (
             f"\n            <disk type='file' device='disk'>"
             f"\n              <driver name='qemu' type='qcow2'/>"
             f"\n              <source file='{overlay}'/>"
-            f"\n              <target dev='{dev}' bus='virtio'/>"
+            f"\n              <target dev='{device}' bus='{disk_bus}'/>"
             f"\n            </disk>")
+    interface_xml = ""
+    for mac, network in interfaces:
+        interface_xml += (
+            f"\n            <interface type='network'>"
+            f"\n              <mac address='{mac}'/>"
+            f"\n              <source network='{network}'/>"
+            f"\n              <model type='virtio'/>"
+            f"\n            </interface>")
     return textwrap.dedent(f"""\
         <domain type='kvm'>
-          <name>{node['domain']}</name>
+          <name>{name}</name>
           <memory unit='KiB'>{memory_kib}</memory>
           <currentMemory unit='KiB'>{memory_kib}</currentMemory>
           <vcpu placement='static'>{vcpus}</vcpu>
@@ -6238,65 +6371,35 @@ def gen_compact_vm_xml(clone_id, node, overlay_disks,
           <on_crash>destroy</on_crash>
           <devices>
             <emulator>{emulator}</emulator>{disk_xml}
-            <controller type='scsi' index='0' model='virtio-scsi'/>
-            <interface type='network'>
-              <mac address='{node['mac']}'/>
-              <source network='test-infra-net-{clone_id}'/>
-              <model type='virtio'/>
-            </interface>
+            <controller type='scsi' index='0' model='virtio-scsi'/>{interface_xml}
             <serial type='pty'><target port='0'/></serial>
             <console type='pty'><target type='serial' port='0'/></console>
           </devices>
         </domain>""")
+
+
+def gen_compact_vm_xml(clone_id, node, overlay_disks,
+                       memory_kib=67108864, vcpus=16,
+                       machine_type=DEFAULT_VM_MACHINE_TYPE, emulator=DEFAULT_VM_EMULATOR):
+    """Build libvirt domain XML for one compact guest."""
+    return _gen_domain_xml(
+        node["domain"], overlay_disks, "virtio",
+        [(node["mac"], f"test-infra-net-{clone_id}")],
+        memory_kib, vcpus, machine_type, emulator,
+    )
 
 
 def gen_vm_xml(clone_id, overlay_disks, mac_primary, mac_secondary,
                memory_kib=67108864, vcpus=16,
                machine_type=DEFAULT_VM_MACHINE_TYPE, emulator=DEFAULT_VM_EMULATOR):
-    if isinstance(overlay_disks, str):
-        overlay_disks = [overlay_disks]
-    disk_xml = ""
-    for i, overlay in enumerate(overlay_disks):
-        dev = f"sd{chr(97 + i)}"
-        disk_xml += (
-            f"\n            <disk type='file' device='disk'>"
-            f"\n              <driver name='qemu' type='qcow2'/>"
-            f"\n              <source file='{overlay}'/>"
-            f"\n              <target dev='{dev}' bus='scsi'/>"
-            f"\n            </disk>")
-    return textwrap.dedent(f"""\
-        <domain type='kvm'>
-          <name>test-infra-cluster-{clone_id}-master-0</name>
-          <memory unit='KiB'>{memory_kib}</memory>
-          <currentMemory unit='KiB'>{memory_kib}</currentMemory>
-          <vcpu placement='static'>{vcpus}</vcpu>
-          <os>
-            <type arch='x86_64' machine='{machine_type}'>hvm</type>
-            <boot dev='hd'/>
-          </os>
-          <features><acpi/><apic/><pae/></features>
-          <cpu mode='host-passthrough' check='none' migratable='on'/>
-          <clock offset='utc'/>
-          <on_poweroff>destroy</on_poweroff>
-          <on_reboot>restart</on_reboot>
-          <on_crash>destroy</on_crash>
-          <devices>
-            <emulator>{emulator}</emulator>{disk_xml}
-            <controller type='scsi' index='0' model='virtio-scsi'/>
-            <interface type='network'>
-              <mac address='{mac_primary}'/>
-              <source network='test-infra-net-{clone_id}'/>
-              <model type='virtio'/>
-            </interface>
-            <interface type='network'>
-              <mac address='{mac_secondary}'/>
-              <source network='test-infra-secondary-network-{clone_id}'/>
-              <model type='virtio'/>
-            </interface>
-            <serial type='pty'><target port='0'/></serial>
-            <console type='pty'><target type='serial' port='0'/></console>
-          </devices>
-        </domain>""")
+    return _gen_domain_xml(
+        f"test-infra-cluster-{clone_id}-master-0", overlay_disks, "scsi",
+        [
+            (mac_primary, f"test-infra-net-{clone_id}"),
+            (mac_secondary, f"test-infra-secondary-network-{clone_id}"),
+        ],
+        memory_kib, vcpus, machine_type, emulator,
+    )
 
 
 HAPROXY_BASE_CONFIG = textwrap.dedent("""\

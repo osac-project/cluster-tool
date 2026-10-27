@@ -96,7 +96,7 @@ class MockStateEnv:
 
         return r
 
-    def mock_write_file(self, path, content):
+    def mock_write_file(self, path, content, *, private=False):
         self._files[path] = content
         if "state.json" in path:
             self._state_data = content
@@ -1199,7 +1199,6 @@ Used memory:    67108864 KiB"""
         subnet = ct.parse_subnet(net_xml)
         self.assertEqual(subnet, 135)
 
-
 class TestCompactInspect(unittest.TestCase):
     _NET = """<network xmlns:dnsmasq="http://libvirt.org/schemas/network/dnsmasq/1.0">
           <name>mno-test2</name>
@@ -1312,6 +1311,8 @@ class TestCompactInspect(unittest.TestCase):
                 ct.discover_compact_source("mno-test2")
         self.assertIn("No 3-master compact source", str(ctx.exception))
 
+
+class TestCompactCloneResources(unittest.TestCase):
     def test_compact_network_xml_round_trips(self):
         macs = ["02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:03"]
         nodes = ct.compact_node_plan("aabbccdd", 200, macs)
@@ -1398,6 +1399,8 @@ class TestCompactInspect(unittest.TestCase):
         self.assertIn("/data/master-0-0-spare.qcow2", spare)
         self.assertEqual(spare.count("<interface "), 1)
 
+
+class TestCompactEtcdRestore(unittest.TestCase):
     def test_etcd_restore_commands_share_one_snapshot(self):
         nodes = ct.compact_node_plan("aabbccdd", 200, [
             "02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:03"])
@@ -1435,6 +1438,8 @@ class TestCompactInspect(unittest.TestCase):
                 "/tmp/snapshot.db", "aabbccdd")
         self.assertIn("etcd restore needs members", str(ctx.exception))
 
+
+class TestCompactIdentity(unittest.TestCase):
     def _source(self):
         return {
             "api_vip": "192.168.124.5",
@@ -1613,6 +1618,8 @@ class TestCompactInspect(unittest.TestCase):
             "DNS:kubernetes, DNS:kubernetes.default, IP Address:172.30.0.1",
             "api-int.test-infra-cluster-aabbccdd.redhat.com"))
 
+
+class TestCompactCertificates(unittest.TestCase):
     def test_compact_api_certificate_recovery_orders_install_before_refresh(self):
         calls = []
         with patch.object(ct, "_ensure_api_certificates", side_effect=lambda *args: calls.append("install")), \
@@ -1649,6 +1656,8 @@ class TestCompactInspect(unittest.TestCase):
         with self.assertRaises(ValueError):
             ct.compact_apiserver_host_ip_script("not-an-ip")
 
+
+class TestCompactMcdRecovery(unittest.TestCase):
     def test_compact_mcd_pod_address_rows_read_host_network_identity_and_readiness(self):
         raw = json.dumps({"items": [
             {
@@ -1785,6 +1794,8 @@ class TestCompactInspect(unittest.TestCase):
         self.assertFalse(any("KUBE_DELETE_HTTP_STATUS" in call.args[0]
                              for call in env.run.call_args_list))
 
+
+class TestCompactBootRecovery(unittest.TestCase):
     def test_api_recovery_refreshes_host_ips_and_stale_leases_before_endpoints(self):
         source = inspect.getsource(ct._recover_compact_api_certificates_and_endpoints)
         certs = source.index("_recover_compact_api_certificates(")
@@ -1795,11 +1806,12 @@ class TestCompactInspect(unittest.TestCase):
         self.assertNotIn("_ensure_compact_mcd_pod_addresses(", source)
         self.assertLess(host_ips, leases)
         self.assertLess(leases, endpoints)
-        finish = inspect.getsource(ct._finish_compact_clone)
-        self.assertIn("_recover_compact_api_certificates_and_endpoints(", finish)
-        ready_check = finish.index("if ready == len(nodes) and addresses_ok")
-        mcd_refresh = finish.index("_ensure_compact_mcd_pod_addresses(")
-        install_gate = finish.index("compact_install_observation_ready(")
+        identity = inspect.getsource(ct._apply_compact_identity_phase)
+        self.assertIn("_recover_compact_api_certificates_and_endpoints(", identity)
+        readiness = inspect.getsource(ct._wait_compact_install_ready)
+        ready_check = readiness.index("if ready == len(nodes) and addresses_ok")
+        mcd_refresh = readiness.index("_ensure_compact_mcd_pod_addresses(")
+        install_gate = readiness.index("compact_install_observation_ready(")
         self.assertLess(ready_check, mcd_refresh)
         self.assertLess(mcd_refresh, install_gate)
 
@@ -1952,6 +1964,8 @@ class TestCompactInspect(unittest.TestCase):
             "etcd-master-0-1 0/5 Pending 0 1m\n"
             "etcd-guard-master-0-0 1/1 Running 0 1m\n"), 1)
 
+
+class TestCompactLeases(unittest.TestCase):
     def test_compact_master_lease_cleanup_keeps_clone_ips_only(self):
         node_ips = [
             "192.168.220.69",
@@ -2147,37 +2161,49 @@ class TestCompactInspect(unittest.TestCase):
     def test_compact_finish_clears_expired_mco_lease_before_mco_render(self):
         source = inspect.getsource(ct._finish_compact_clone)
         clear_lease = source.index("_clear_expired_mco_controller_lease(clone_oc, work)")
-        prepare_render = source.index("_wait_compact_machineconfig_source(clone_oc")
+        prepare_render = source.index("_apply_compact_identity_phase(ctx, clone_oc)")
         self.assertLess(clear_lease, prepare_render)
-
-    def test_etcd_bundle_update_is_ordered_and_fail_closed(self):
-        source = inspect.getsource(ct._finish_compact_clone)
-        sign = source.index("sign kubelet certificates with the live CSR signer")
-        rewrite = source.index("rewrite cluster records and 00-master")
-        health = source.index("wait until etcd and the API revisions are installed for vmaas")
-        requires = []
-        start = 0
-        while True:
-            found = source.find("_require_reissued_etcd_certs(", start)
-            if found < 0:
-                break
-            requires.append(found)
-            start = found + 1
-        self.assertEqual(requires, sorted(requires))
-        self.assertEqual(len(requires), 2)
-        self.assertLess(requires[0], sign)
-        self.assertLess(sign, rewrite)
-        self.assertLess(requires[1], rewrite)
-        self.assertLess(rewrite, health)
-        self.assertNotIn("_sync_reissued_etcd_certs(", source)
-        self.assertNotIn("copy_to_nodes=True", source)
-        self.assertNotIn("over the operator revision", source)
-        self.assertEqual(source.count("sudo systemctl restart kubelet"), 1)
         self.assertIn(
-            "master-0-0 kubelet after installing its clone client certificate", source)
-        self.assertNotIn("systemctl restart crio", source)
-        self.assertIn("publish clone node IPs without restarting kubelet", source)
-        self.assertNotIn("is core-ready", source)
+            "_wait_compact_machineconfig_source(clone_oc",
+            inspect.getsource(ct._apply_compact_identity_phase),
+        )
+
+
+class TestCompactReadiness(unittest.TestCase):
+    def test_etcd_bundle_update_is_ordered_and_fail_closed(self):
+        recert = inspect.getsource(ct._run_compact_recert_phase)
+        finish = inspect.getsource(ct._finish_compact_clone)
+        rewrite = inspect.getsource(ct._apply_compact_identity_phase)
+        readiness = inspect.getsource(ct._wait_compact_install_ready)
+        self.assertLess(
+            recert.index("_require_reissued_etcd_certs("),
+            recert.index("sign kubelet certificates with the live CSR signer"),
+        )
+        self.assertLess(
+            finish.index("_require_reissued_etcd_certs("),
+            finish.index("_apply_compact_identity_phase(ctx, clone_oc)"),
+        )
+        self.assertLess(
+            finish.index("_run_compact_recert_phase(ctx)"),
+            finish.index("_apply_compact_identity_phase(ctx, clone_oc)"),
+        )
+        self.assertLess(
+            finish.index("_apply_compact_identity_phase(ctx, clone_oc)"),
+            finish.index("_wait_compact_install_ready("),
+        )
+        self.assertIn("rewrite cluster records and 00-master", rewrite)
+        self.assertIn(
+            "wait until etcd and the API revisions are installed for vmaas", readiness)
+        combined = recert + finish + rewrite + readiness
+        self.assertNotIn("_sync_reissued_etcd_certs(", combined)
+        self.assertNotIn("copy_to_nodes=True", combined)
+        self.assertNotIn("over the operator revision", combined)
+        self.assertEqual(combined.count("sudo systemctl restart kubelet"), 1)
+        self.assertIn(
+            "master-0-0 kubelet after installing its clone client certificate", recert)
+        self.assertNotIn("systemctl restart crio", combined)
+        self.assertIn("publish clone node IPs without restarting kubelet", finish)
+        self.assertNotIn("is core-ready", combined)
         require_source = inspect.getsource(ct._require_reissued_etcd_certs)
         self.assertLess(
             require_source.index("etcd certificate inputs"),
@@ -2291,9 +2317,11 @@ class TestCompactInspect(unittest.TestCase):
                             ),
                         ), \
                         self.assertRaises(SystemExit) as aborted:
-                    ct._finish_compact_clone(
-                        {}, "edge10", nodes, "/id", work, "/crypto", "etcd", "cn",
-                        "/plan", {}, "192.168.210.81", "/src", [], start_at="rewrite")
+                    ct._finish_compact_clone(ct.CompactCloneContext(
+                        source={}, clone_id="edge10", nodes=nodes, identity="/id",
+                        work=work, crypto="/crypto", etcd_image="etcd", ingress_cn="cn",
+                        plan_path="/plan", src_kc="/src", pairs=[],
+                    ), start_at="rewrite")
                 self.assertIn("reading etcd-all-certs failed", str(aborted.exception))
                 self.assertFalse(any("rewrite cluster records" in cmd for cmd in failed.calls))
                 self.assertFalse(any("wait until etcd and the API revisions" in cmd for cmd in failed.calls))
@@ -2511,15 +2539,15 @@ class TestCompactInspect(unittest.TestCase):
         self.assertTrue(ct.compact_install_observation_ready(3, True, [], [], True))
         self.assertFalse(ct.compact_install_observation_ready(
             3, True, [], [], True, endpoints_ready=False))
-        finish = inspect.getsource(ct._finish_compact_clone)
-        self.assertIn('"render": resolve_master_render', finish)
+        identity = inspect.getsource(ct._apply_compact_identity_phase)
+        self.assertIn('"render": resolve_master_render', identity)
         self.assertIn(
             '"api-certificates": lambda: _recover_compact_api_certificates_and_endpoints(',
-            finish,
+            identity,
         )
         recovery = inspect.getsource(ct._recover_compact_api_certificates)
         self.assertLess(recovery.index("_ensure_api_certificates"), recovery.index("_refresh_internal_api_certificate"))
-        self.assertNotIn("time.sleep(30)", finish)
+        self.assertNotIn("time.sleep(30)", identity)
 
     def test_kube_apiserver_install_readiness_uses_each_advanced_node(self):
         rolling_but_available = {"status": {"conditions": [
@@ -2622,9 +2650,11 @@ class TestCompactInspect(unittest.TestCase):
                         ("192.168.214.69", "192.168.214.81", "192.168.214.89"),
                     )
                 ]
-                ct._finish_compact_clone(
-                    {}, "edge14", nodes, "/id", "/work", "/crypto", "etcd", "cn",
-                    "/plan", {}, "192.168.214.81", "/src", [], start_at="health")
+                ct._finish_compact_clone(ct.CompactCloneContext(
+                    source={}, clone_id="edge14", nodes=nodes, identity="/id",
+                    work="/work", crypto="/crypto", etcd_image="etcd", ingress_cn="cn",
+                    plan_path="/plan", src_kc="/src", pairs=[],
+                ), start_at="health")
             self.assertIn("revision baselines", str(aborted.exception))
             self.assertFalse(any("wait until etcd and the API revisions" in cmd for cmd in missing.calls))
             saved = _Env(json.dumps({"etcd": 10, "kube-apiserver": 5}))
@@ -2669,6 +2699,8 @@ class TestCompactInspect(unittest.TestCase):
         self.assertIn("kube-apiserver Progressing NodeInstallerProgressing", blocker)
         self.assertNotIn("ignored", blocker)
 
+
+class TestCompactFlavor(unittest.TestCase):
     def test_compact_boot_refuses_before_the_sno_path(self):
         class _State:
             def __enter__(self):
@@ -2777,24 +2809,8 @@ class TestCompactInspect(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 ct.record_compact_clone("edge3", 201, "mno-3node")
 
-    def _kubernetes_endpoint_fixtures(self, ips, ready=True):
-        endpoints = {
-            "metadata": {"managedFields": [{"manager": "kube-controller-manager"}]},
-            "subsets": [{
-                "addresses": [{"ip": ip} for ip in ips],
-                "ports": [{"name": "https", "port": 6443, "protocol": "TCP"}],
-            }],
-        }
-        endpoint_slice = {
-            "metadata": {"managedFields": [{"manager": "kube-controller-manager"}]},
-            "ports": [{"name": "https", "port": 6443, "protocol": "TCP"}],
-            "endpoints": [
-                {"addresses": [ip], "conditions": {"ready": ready}}
-                for ip in ips
-            ],
-        }
-        return json.dumps(endpoints), json.dumps(endpoint_slice)
 
+class TestCompactMachineConfig(unittest.TestCase):
     def test_machineconfig_retry_reuses_clone_specific_render(self):
         domain = "test-infra-cluster-edge20.redhat.com"
         body = f"KUBERNETES_SERVICE_HOST='api-int.{domain}'\nKUBERNETES_SERVICE_PORT='6443'\n"
@@ -2959,6 +2975,26 @@ class TestCompactInspect(unittest.TestCase):
                 "KUBERNETES_SERVICE_HOST='api-int.edge16-24g.redhat.com'\n", safe=""))
         self.assertFalse(ct.compact_machineconfig_input_has_clone_api_url(
             machineconfig, domain))
+
+
+class TestCompactEndpoints(unittest.TestCase):
+    def _kubernetes_endpoint_fixtures(self, ips, ready=True):
+        endpoints = {
+            "metadata": {"managedFields": [{"manager": "kube-controller-manager"}]},
+            "subsets": [{
+                "addresses": [{"ip": ip} for ip in ips],
+                "ports": [{"name": "https", "port": 6443, "protocol": "TCP"}],
+            }],
+        }
+        endpoint_slice = {
+            "metadata": {"managedFields": [{"manager": "kube-controller-manager"}]},
+            "ports": [{"name": "https", "port": 6443, "protocol": "TCP"}],
+            "endpoints": [
+                {"addresses": [ip], "conditions": {"ready": ready}}
+                for ip in ips
+            ],
+        }
+        return json.dumps(endpoints), json.dumps(endpoint_slice)
 
     def test_kubernetes_endpoint_check_rejects_stale_addresses(self):
         clone_ips = ["192.168.220.69", "192.168.220.81", "192.168.220.89"]
@@ -3182,6 +3218,8 @@ class TestCompactInspect(unittest.TestCase):
                 "oc", [{"ip": ip} for ip in clone_ips], "/work"))
         self.assertEqual(sum("patch endpoints kubernetes" in cmd for cmd in fake_env.calls), 3)
 
+
+class TestCompactHelpers(unittest.TestCase):
     def test_apiserver_etcd_trust_copy_uses_only_the_quorum_ca(self):
         command = ct.compact_apiserver_etcd_trust_tar_command()
         self.assertIn("etcd-serving-ca/ca-bundle.crt", command)
@@ -3811,9 +3849,9 @@ class TestPush(unittest.TestCase):
             r.stdout = "disk-0.chunk.aa.zst\ndisk-0.chunk.ab.zst\ndisk-1.chunk.aa.zst\n"
         return r
 
-    def _mock_write_file(self, path, content):
+    def _mock_write_file(self, path, content, *, private=False):
         self.written_files[path] = content
-        self.mock_env.mock_write_file(path, content)
+        self.mock_env.mock_write_file(path, content, private=private)
 
     def test_push_flavor_not_found(self):
         wrapped = self.mock_env.wrap_run_positional(self._inner_mock_run)
