@@ -368,7 +368,9 @@ def parse_disk_paths(dumpxml_output, pool_name):
         if source.get("file"):
             path = source.get("file")
         elif source.get("pool") and source.get("volume"):
-            r = env.run(f"virsh vol-path --pool {source.get('pool')} {source.get('volume')}")
+            r = env.run(
+                f"virsh vol-path --pool {shlex.quote(source.get('pool'))} "
+                f"{shlex.quote(source.get('volume'))}")
             path = r.stdout.strip()
         if path:
             disks.append({"target": target.get("dev"), "path": path})
@@ -3232,14 +3234,14 @@ def compact_serviceaccount_auth_results(oc, nodes, work):
     token = (minted.stdout or "").strip()
     if minted.returncode != 0 or token.count(".") != 2 or any(char.isspace() for char in token):
         return failed
-    path = f"{work}/.sa-probe-token"
-    env.write_file(path, token + "\n", private=True)
+    path = f"{work}/.sa-probe-header"
+    env.write_file(path, f"Authorization: Bearer {token}\n", private=True)
     env.run(f"chmod 600 {shlex.quote(path)}")
     results = []
     try:
         probes = _in_parallel_results(nodes, lambda node: env.run(
             "code=$(curl -sk -o /dev/null -w '%{http_code}' "
-            f"-H \"Authorization: Bearer $(cat {shlex.quote(path)})\" "
+            f"-H {shlex.quote('@' + path)} "
             f"{shlex.quote('https://' + node['ip'] + ':6443/readyz')}); "
             "printf '%s' \"$code\"",
             check=False))
@@ -5538,7 +5540,9 @@ def _guest_mac(disk, booted_deployment=None):
     listing = _guest_run(disk, "virt-ls", directory)
     if listing.returncode != 0:
         sys.exit(f"Could not list NetworkManager connections on {disk}")
-    for name in listing.stdout.split():
+    for name in listing.stdout.splitlines():
+        if not name:
+            continue
         mac = parse_nm_mac(_guest_cat(
             disk, f"/etc/NetworkManager/system-connections/{name}", booted_deployment))
         if mac:
@@ -6224,12 +6228,15 @@ def compact_domain_owned_by_clone(xml, clone_id, role):
         if not path:
             return False
         paths.append(os.path.normpath(path))
-    allowed = {
-        os.path.normpath(compact_role_disk_dest(clone_id, role, 0)),
-        os.path.normpath(compact_role_disk_dest(clone_id, role, 1)),
-        os.path.normpath(f"/var/lib/libvirt/images/{clone_id}-{role}.qcow2"),
-    }
-    return bool(paths) and set(paths).issubset(allowed)
+    clone_dir = os.path.normpath(f"/var/lib/libvirt/images/{clone_id}")
+    legacy = os.path.normpath(f"/var/lib/libvirt/images/{clone_id}-{role}.qcow2")
+
+    pattern = re.compile(rf"{re.escape(role)}(?:-spare|-disk(?:[2-9]|[1-9][0-9]+))?\.qcow2")
+    return bool(paths) and all(
+        path == legacy or (
+            os.path.dirname(path) == clone_dir
+            and pattern.fullmatch(os.path.basename(path)) is not None)
+        for path in paths)
 
 
 def compact_network_owned_by_clone(xml, clone_id):
@@ -6295,8 +6302,6 @@ def undefine_compact_libvirt(clone_id):
         domain = f"test-infra-cluster-{clone_id}-{role}"
         env.run(f"virsh destroy {shlex.quote(domain)}", check=False)
         env.run(f"virsh undefine {shlex.quote(domain)}", check=False)
-        env.run(f"rm -f {shlex.quote(compact_role_disk_dest(clone_id, role, 0))}", check=False)
-        env.run(f"rm -f {shlex.quote(compact_role_disk_dest(clone_id, role, 1))}", check=False)
     net = f"test-infra-net-{clone_id}"
     env.run(f"virsh net-destroy {shlex.quote(net)}", check=False)
     env.run(f"virsh net-undefine {shlex.quote(net)}", check=False)
@@ -7282,6 +7287,7 @@ def cmd_destroy(args):
         info = state["clones"].get(cid, {})
         print(f'Destroying clone "{cid}"...')
         if info.get("topology") == "compact":
+            _safe_clone_id(cid)
             undefine_compact_libvirt(cid)
             env.run(f"rm -rf {shlex.quote(f'/var/lib/libvirt/images/{cid}')}")
             with locked_state() as saved:
