@@ -2318,7 +2318,10 @@ class TestCompactReadiness(unittest.TestCase):
                         ), \
                         self.assertRaises(SystemExit) as aborted:
                     ct._finish_compact_clone(ct.CompactCloneContext(
-                        source={}, clone_id="edge10", nodes=nodes, identity="/id",
+                        source={}, clone_id="edge10", nodes=nodes + [
+                            {"role": "master-0-1", "ip": "192.168.210.81"},
+                            {"role": "master-0-2", "ip": "192.168.210.89"},
+                        ], identity="/id",
                         work=work, crypto="/crypto", etcd_image="etcd", ingress_cn="cn",
                         plan_path="/plan", src_kc="/src", pairs=[],
                     ), start_at="rewrite")
