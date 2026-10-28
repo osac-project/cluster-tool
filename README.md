@@ -141,6 +141,17 @@ Only needed if you need a custom cluster configuration that doesn't exist as a p
   --pull-secret /path/to/pull-secret.json
 ```
 
+### Capture a three-node compact flavor
+
+For a three-master cluster installed by Assisted Installer, use
+[scripts/capture_compact_flavor.py](scripts/capture_compact_flavor.py). It checks
+cluster health and VM specs, captures vda and vdb from each master, registers a local flavor, and restarts the source VMs. The
+source cluster should be bare OpenShift; install OSAC and storage services
+after cloning.
+
+See the [compact flavor capture guide](docs/compact-flavor-capture.md) for
+prerequisites, command examples, and the Quay push step.
+
 ## Quick Start
 
 ```bash
