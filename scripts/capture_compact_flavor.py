@@ -604,8 +604,9 @@ def confirm_downtime(args, domains):
         raise CaptureError("Capture cancelled")
 
 
-def shutdown_domains(args, domains):
+def shutdown_domains(args, domains, shutdown_requested):
     for domain in domains:
+        shutdown_requested.add(domain)
         run(virsh_command(args.libvirt_uri, "shutdown", domain))
     deadline = time.monotonic() + args.shutdown_timeout
     pending = set(domains)
@@ -623,16 +624,88 @@ def shutdown_domains(args, domains):
         )
 
 
-def restart_domains(args, domains):
+def domain_state(args, domain, *, timeout=10):
+    return run(
+        virsh_command(args.libvirt_uri, "domstate", domain), timeout=timeout
+    ).decode().strip().lower()
+
+
+def wait_for_domain_states(args, domains, predicate, *, timeout, description):
+    pending = set(domains)
+    last_state = {}
+    deadline = time.monotonic() + timeout
+    while pending:
+        for domain in sorted(pending):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                state = domain_state(args, domain, timeout=min(10, remaining))
+            except (CaptureError, subprocess.TimeoutExpired) as error:
+                state = ""
+                last_state[domain] = f"state query failed: {error}"
+            else:
+                last_state[domain] = state or "empty state"
+            if state and predicate(state):
+                pending.remove(domain)
+        if not pending or time.monotonic() >= deadline:
+            break
+        print(
+            f"Waiting for source VMs to {description}: "
+            + ", ".join(
+                f"{domain} ({last_state.get(domain, 'state not checked')})"
+                for domain in sorted(pending)
+            ),
+            flush=True,
+        )
+        time.sleep(min(2, max(0, deadline - time.monotonic())))
+    return {domain: last_state.get(domain, "state not checked") for domain in pending}
+
+
+def restart_domains(args, shutdown_requested):
     errors = []
-    for domain in domains:
+    unresolved = wait_for_domain_states(
+        args,
+        shutdown_requested,
+        lambda state: "shut off" in state,
+        timeout=args.shutdown_timeout,
+        description="stop before restart",
+    )
+    for domain, state in sorted(unresolved.items()):
+        errors.append(
+            f"{domain}: did not reach shut off during recovery "
+            f"(last state: {state}); it may power off after the script exits"
+        )
+
+    stopped = set(shutdown_requested) - set(unresolved)
+    started = set()
+    for domain in sorted(stopped):
         try:
-            state = run(virsh_command(args.libvirt_uri, "domstate", domain)).decode().strip().lower()
-            if "running" not in state:
-                run(virsh_command(args.libvirt_uri, "start", domain))
-                print(f"Restarted {domain}.")
+            run(virsh_command(args.libvirt_uri, "start", domain))
+            started.add(domain)
+            print(f"Started {domain}; waiting for it to reach running state.")
         except (CaptureError, subprocess.TimeoutExpired) as error:
-            errors.append(f"{domain}: {error}")
+            try:
+                state = domain_state(args, domain)
+            except (CaptureError, subprocess.TimeoutExpired):
+                state = "state unavailable"
+            if "running" in state or "blocked" in state:
+                started.add(domain)
+            else:
+                errors.append(f"{domain}: could not start: {error} (state: {state})")
+
+    unresolved = wait_for_domain_states(
+        args,
+        started,
+        lambda state: "running" in state or "blocked" in state,
+        timeout=args.shutdown_timeout,
+        description="return to running state",
+    )
+    for domain, state in sorted(unresolved.items()):
+        errors.append(
+            f"{domain}: did not reach running state during recovery "
+            f"(last state: {state})"
+        )
     return errors
 
 
@@ -703,9 +776,26 @@ def save_state_atomic(config_dir, state):
         raise
 
 
+def restore_invoking_user_ownership(path):
+    if os.geteuid() != 0:
+        return
+    sudo_uid = os.environ.get("SUDO_UID")
+    sudo_gid = os.environ.get("SUDO_GID")
+    if sudo_uid is None or sudo_gid is None:
+        return
+    try:
+        os.chown(path, int(sudo_uid), int(sudo_gid))
+    except (OSError, ValueError) as error:
+        raise CaptureError(
+            f"Could not restore invoking-user ownership on {path}: {error}"
+        ) from error
+
+
 def register_flavor(state_dir, lock_dir, stage_dir, flavor_name, metadata):
     state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(lock_dir, 0o700)
+    restore_invoking_user_ownership(lock_dir)
     lock_path = lock_dir / "state.lock"
     descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     final_dir = stage_dir.parent / flavor_name
@@ -713,6 +803,7 @@ def register_flavor(state_dir, lock_dir, stage_dir, flavor_name, metadata):
     saved = False
     try:
         os.fchmod(descriptor, 0o600)
+        restore_invoking_user_ownership(lock_path)
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         state_path = state_dir / "state.json"
         if state_path.exists():
@@ -771,19 +862,20 @@ def main():
     os.chmod(stage_dir, 0o755)
     shutdown_started = False
     restarted = False
+    shutdown_requested = set()
     try:
         extract_crypto(args, stage_dir, identity, public_key)
         confirm_downtime(args, domains)
         try:
             shutdown_started = True
-            shutdown_domains(args, domains)
+            shutdown_domains(args, domains, shutdown_requested)
             capture_disks(args, plan, stage_dir)
         finally:
-            restart_errors = restart_domains(args, domains)
+            restart_errors = restart_domains(args, shutdown_requested)
             restarted = not restart_errors
             if restart_errors:
                 raise CaptureError(
-                    "Failed to restart one or more source VMs:\n  "
+                    "Failed to restore one or more source VMs:\n  "
                     + "\n  ".join(restart_errors)
                 )
 
