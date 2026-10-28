@@ -29,8 +29,9 @@ namespaces; remove those add-ons before capturing.
 ## Before you start
 
 Run as root on the libvirt host. The host must already be initialized for local
-cluster-tool use, with ~/.config/cluster-tool/config pointing to its data
-directory. Required commands are virsh, qemu-img, oc, ssh, ssh-keygen, and openssl.
+cluster-tool use. If invoked through sudo, the script reads config and state
+from the invoking user's ~/.config/cluster-tool directory and uses the same
+directory for locking. Required commands are virsh, qemu-img, oc, ssh, ssh-keygen, and openssl.
 
 The defaults match the MNO flavor we created in this session:
 
@@ -50,7 +51,8 @@ Have the following information ready:
   test-infra-cluster-edge16-master-0-0 through -0-2 use
   test-infra-cluster-edge16.
 - The source primary subnet's third octet (for example, 123 for
-  192.168.123.0/24).
+  192.168.123.0/24). The script checks that the API address and all three
+  node InternalIPs are inside 192.168.<octet>.0/24 before capture.
 - A kubeconfig with cluster-admin access, the reachable API IP, and a DNS name
   present in the API serving certificate. The script uses the IP for the
   connection and the DNS name for TLS verification.
@@ -59,17 +61,20 @@ Have the following information ready:
   non-interactively and have mode 0600. Its matching .pub file must be next
   to it unless --ssh-public-key is provided.
 - Enough free space under the configured CLUSTER_TOOL_DATA directory. The
-  script estimates the source disks' allocated size and requires a 15% margin
-  plus 1 GiB.
+  preflight sums the disks' virtual sizes as a conservative estimate of
+  materialized output, then requires a 15% margin plus 1 GiB. Sparse qcow2
+  output may use less, but the check will not assume that it can.
 
 The source VMs must be running when you start. The capture gracefully shuts
 down all three VMs while copying disks, so the source cluster will be
 unavailable for several minutes. The script tracks every VM sent a shutdown
 request, waits for it to stop, restarts it, and confirms it returns to a
 running state, including when disk capture fails. If recovery times out, it
-reports the unresolved VM and preserves the staging directory; a VM still
-shutting down may power off after the script exits. The script never
-force-powers VMs off.
+reports that manual follow-up is required and preserves the staging directory;
+a VM still shutting down may power off after the script exits. The script never
+force-powers VMs off. Credential extraction has a 60-second timeout, and each
+disk conversion has a one-hour timeout. The VMs are restarted after a conversion
+timeout.
 
 ## Capture the flavor
 
