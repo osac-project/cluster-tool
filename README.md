@@ -218,7 +218,7 @@ For CI, use `local` as the host when running directly on the baremetal machine:
 | `pull IMAGE [--server S]` | Pull a flavor from an OCI registry. Downloads, decompresses, reassembles, registers. |
 | `inspect --source SOURCE --host HOST [--network NETWORK]` | Read-only inspection of a live three-master compact source. |
 | `compact-heal --source SOURCE --host HOST --clone-id ID --subnet N [--network NETWORK] [--ingress-cn CN]` | Print the proposed compact-clone heal plan. It does not change the source or apply the plan. |
-| `compact-clone --source SOURCE --host HOST --clone-id ID --subnet N [--identity KEY] [--memory-kib N] [--vcpus N] [--resume STAGE]` | Create a clone directly from a live three-master source, restore etcd, run Recert, and heal the clone. |
+| `compact-clone --source SOURCE --host HOST --clone-id ID --subnet N [--network NETWORK] [--identity KEY] [--memory-kib N] [--vcpus N] [--resume STAGE]` | Create a clone directly from a live three-master source, restore etcd, run Recert, and heal the clone. |
 | `compact-boot --flavor FLAVOR --name ID --host HOST [--subnet N] [--identity KEY] [--pull-secret FILE] [--memory-kib N] [--vcpus N] [--resume STAGE]` | Boot and heal a pulled three-master compact flavor. If omitted, the subnet is allocated automatically. |
 
 ### Compact three-master workflow
