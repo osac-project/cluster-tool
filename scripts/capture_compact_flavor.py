@@ -36,28 +36,57 @@ class CaptureError(Exception):
 
 
 def display_command(command):
-    return " ".join(str(part) for part in command)
+    """Return a command label without exposing arguments that may contain secrets."""
+    executable = Path(str(command[0])).name
+    arguments = [str(part) for part in command[1:]]
+    if executable == "oc":
+        operation = next((arg for arg in arguments if arg in {"get", "extract"}), None)
+    elif executable == "virsh":
+        operations = {"dominfo", "dumpxml", "vol-path", "shutdown", "domstate", "start"}
+        operation = next((arg for arg in arguments if arg in operations), None)
+    elif executable == "qemu-img":
+        operations = {"info", "convert", "check"}
+        operation = next((arg for arg in arguments if arg in operations), None)
+    elif executable == "ssh":
+        operation = "preflight"
+    elif executable == "ssh-keygen":
+        operation = "key-validation"
+    elif executable == "openssl":
+        operation = next((arg for arg in arguments if arg in {"pkey", "x509"}), None)
+    else:
+        operation = None
+    return f"{executable} {operation}" if operation else executable
 
 
 def run(command, *, timeout=60, input_bytes=None):
-    result = subprocess.run(
-        [str(part) for part in command],
-        input=input_bytes,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=timeout,
-    )
+    """Run a command with bounded time and return its standard output."""
+    try:
+        result = subprocess.run(
+            [str(part) for part in command],
+            input=input_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise CaptureError(
+            f"Command timed out after {timeout} seconds: {display_command(command)}"
+        ) from error
     if result.returncode:
-        detail = result.stderr.decode(errors="replace").strip()
         raise CaptureError(
             f"Command failed ({result.returncode}): {display_command(command)}"
-            + (f"\n{detail}" if detail else "")
         )
     return result.stdout
 
 
-def run_visible(command, *, timeout=None):
-    result = subprocess.run([str(part) for part in command], timeout=timeout)
+def run_visible(command, *, timeout=3600):
+    """Run a command with visible progress and a bounded timeout."""
+    try:
+        result = subprocess.run([str(part) for part in command], timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        raise CaptureError(
+            f"Command timed out after {timeout} seconds: {display_command(command)}"
+        ) from error
     if result.returncode:
         raise CaptureError(
             f"Command failed ({result.returncode}): {display_command(command)}"
@@ -65,12 +94,14 @@ def run_visible(command, *, timeout=None):
 
 
 def require_programs(names):
+    """Fail early when a required host command is unavailable."""
     missing = [name for name in names if shutil.which(name) is None]
     if missing:
         raise CaptureError(f"Missing required command(s): {', '.join(missing)}")
 
 
 def parse_args():
+    """Parse command-line options for a compact flavor capture."""
     parser = argparse.ArgumentParser(
         description=(
             "Capture a healthy, bare three-node compact OpenShift cluster into "
@@ -166,6 +197,7 @@ def parse_args():
 
 
 def validate_args(args):
+    """Validate user-supplied names, addresses, and resource sizes."""
     for label, value in (
         ("flavor", args.flavor),
         ("source-cluster", args.source_cluster),
@@ -203,11 +235,19 @@ def validate_args(args):
         raise CaptureError("Expected memory, vCPU, and disk sizes must be positive")
 
 
+def invoking_home():
+    """Return the home directory cluster-tool uses for the invoking user."""
+    invoking_user = os.environ.get("SUDO_USER")
+    return Path(os.path.expanduser(f"~{invoking_user}")) if invoking_user else Path.home()
+
+
 def server_config():
-    config_file = Path.home() / ".config" / "cluster-tool" / "config"
+    """Load cluster-tool paths from the invoking user's configuration."""
+    config_dir = invoking_home() / ".config" / "cluster-tool"
+    config_file = config_dir / "config"
     if not config_file.is_file():
         raise CaptureError(
-            f"{config_file} is missing; initialize cluster-tool on this host first"
+            "cluster-tool config is missing; initialize cluster-tool on this host first"
         )
     data_dir = None
     for line in config_file.read_text().splitlines():
@@ -215,17 +255,19 @@ def server_config():
             data_dir = line.split("=", 1)[1].strip().strip("'").strip('"')
             break
     if not data_dir:
-        raise CaptureError(f"No CLUSTER_TOOL_DATA entry found in {config_file}")
+        raise CaptureError("No CLUSTER_TOOL_DATA entry found in cluster-tool config")
+    data_dir = data_dir.replace("${HOME}", str(config_dir.parent.parent))
+    data_dir = data_dir.replace("$HOME", str(config_dir.parent.parent))
+    if data_dir == "~":
+        data_dir = str(config_dir.parent.parent)
+    elif data_dir.startswith("~/"):
+        data_dir = str(config_dir.parent.parent / data_dir[2:])
     data_dir = Path(os.path.expandvars(os.path.expanduser(data_dir)))
-    state_dir = Path.home() / ".config" / "cluster-tool"
-    # Match cluster-tool's locked_state() path when invoked through sudo.
-    invoking_user = os.environ.get("SUDO_USER", "")
-    lock_home = Path(os.path.expanduser(f"~{invoking_user}"))
-    lock_dir = lock_home / ".config" / "cluster-tool"
-    return state_dir, lock_dir, data_dir
+    return config_dir, config_dir, data_dir
 
 
 def oc_command(args, *subcommand):
+    """Build an oc command using the configured API endpoint and kubeconfig."""
     return [
         shutil.which("oc") or "oc",
         f"--kubeconfig={Path(args.kubeconfig).expanduser()}",
@@ -236,14 +278,17 @@ def oc_command(args, *subcommand):
 
 
 def oc_json(args, *subcommand):
+    """Run an oc query and decode its JSON response."""
     return json.loads(run(oc_command(args, *subcommand)))
 
 
 def condition_map(conditions):
+    """Index Kubernetes conditions by condition type."""
     return {condition.get("type"): condition.get("status") for condition in conditions}
 
 
 def is_ipv4(address):
+    """Return whether an address is a valid IPv4 address."""
     try:
         return isinstance(ipaddress.ip_address(address), ipaddress.IPv4Address)
     except ValueError:
@@ -251,6 +296,7 @@ def is_ipv4(address):
 
 
 def verify_cluster(args):
+    """Require a healthy bare three-node cluster before capture."""
     print("Checking source cluster readiness...")
     nodes = oc_json(args, "get", "nodes", "-o", "json").get("items", [])
     by_name = {node.get("metadata", {}).get("name"): node for node in nodes}
@@ -277,6 +323,16 @@ def verify_cluster(args):
         if not ipv4_addresses:
             raise CaptureError(f"Could not find an IPv4 InternalIP for {name}")
         node_ips[name] = ipv4_addresses[0]
+
+    source_network = ipaddress.ip_network(
+        f"192.168.{args.source_primary_subnet}.0/24"
+    )
+    source_addresses = [args.api_address, *node_ips.values()]
+    if any(ipaddress.ip_address(address) not in source_network for address in source_addresses):
+        raise CaptureError(
+            "The API and all source node addresses must match "
+            "--source-primary-subnet (192.168.<octet>.0/24)"
+        )
 
     namespaces = oc_json(args, "get", "namespaces", "-o", "json").get("items", [])
     add_on_namespaces = []
@@ -358,10 +414,12 @@ def verify_cluster(args):
 
 
 def virsh_command(uri, *args):
+    """Build a virsh command for the selected libvirt connection."""
     return ["virsh", "--connect", uri, *args]
 
 
 def parse_dominfo(output, domain):
+    """Read and validate CPU, memory, and state from domain information."""
     fields = {}
     for line in output.decode(errors="replace").splitlines():
         if ":" in line:
@@ -379,6 +437,7 @@ def parse_dominfo(output, domain):
 
 
 def resolve_domain_disks(uri, domain):
+    """Map a source VM's vda and vdb devices to disk paths."""
     xml = ET.fromstring(run(virsh_command(uri, "dumpxml", domain)))
     result = {}
     for disk in xml.findall("./devices/disk"):
@@ -414,13 +473,15 @@ def resolve_domain_disks(uri, domain):
 
 
 def image_info(path):
-    info = json.loads(run(["qemu-img", "info", "--output=json", path]))
+    """Read and validate qcow2 or raw image metadata."""
+    info = json.loads(run(["qemu-img", "info", "-U", "--output=json", path]))
     if info.get("format") not in ("qcow2", "raw"):
-        raise CaptureError(f"Unsupported source disk format for {path}: {info.get('format')}")
+        raise CaptureError("Unsupported source disk format")
     return info
 
 
 def collect_source_plan(args):
+    """Validate master resources and disk layout before downtime."""
     domains = []
     plan = {}
     expected_memory = args.expected_memory_gib * 1024 * 1024
@@ -465,6 +526,7 @@ def collect_source_plan(args):
 
 
 def preflight_ssh(args, public_key, node_ips):
+    """Verify non-interactive core SSH access to every source master."""
     identity = Path(args.ssh_identity).expanduser()
     if not identity.is_file():
         raise CaptureError(f"SSH identity does not exist: {identity}")
@@ -497,14 +559,14 @@ def preflight_ssh(args, public_key, node_ips):
             run(command, timeout=20)
         except CaptureError as error:
             raise CaptureError(
-                f"SSH preflight failed for {node_name} ({node_ips[node_name]}). "
-                "The public key must already be trusted by core on all three "
-                f"masters. {error}"
+                f"SSH preflight failed for {node_name}. The key must already be "
+                "trusted by core on all three masters."
             ) from error
     print("SSH key access verified on all three masters.")
 
 
 def create_private_file(path, data, mode=0o600):
+    """Create a new file without overwriting it and set its mode."""
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
     with os.fdopen(descriptor, "wb") as output:
         output.write(data)
@@ -513,6 +575,7 @@ def create_private_file(path, data, mode=0o600):
 
 
 def extract_secret(args, destination, resource, namespace, key):
+    """Extract one required credential with a bounded timeout."""
     command = oc_command(
         args,
         "extract",
@@ -523,15 +586,19 @@ def extract_secret(args, destination, resource, namespace, key):
         "--to=-",
     )
     descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "wb") as output:
-        result = subprocess.run(command, stdout=output, stderr=subprocess.PIPE)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            result = subprocess.run(
+                command, stdout=output, stderr=subprocess.PIPE, timeout=60
+            )
+    except subprocess.TimeoutExpired as error:
+        destination.unlink(missing_ok=True)
+        raise CaptureError(
+            "Timed out after 60 seconds while extracting required credential material"
+        ) from error
     if result.returncode:
         destination.unlink(missing_ok=True)
-        detail = result.stderr.decode(errors="replace").strip()
-        raise CaptureError(
-            f"Could not extract {resource} key {key}"
-            + (f": {detail}" if detail else "")
-        )
+        raise CaptureError("Could not extract required credential material")
     if destination.stat().st_size == 0:
         destination.unlink(missing_ok=True)
         raise CaptureError(f"Extracted {resource} key {key} was empty")
@@ -539,6 +606,7 @@ def extract_secret(args, destination, resource, namespace, key):
 
 
 def extract_crypto(args, stage_dir, identity, public_key):
+    """Collect and validate the signing and SSH material for the flavor."""
     crypto = stage_dir / "crypto"
     crypto.mkdir(mode=0o700)
     os.chmod(crypto, 0o700)
@@ -590,6 +658,7 @@ def extract_crypto(args, stage_dir, identity, public_key):
 
 
 def confirm_downtime(args, domains):
+    """Require explicit acknowledgment before stopping the source VMs."""
     print(
         "The next step will gracefully shut down the three source VMs, capture their "
         "six disks, and restart them. The source cluster will be unavailable during capture."
@@ -605,6 +674,7 @@ def confirm_downtime(args, domains):
 
 
 def shutdown_domains(args, domains, shutdown_requested):
+    """Request graceful shutdown and wait for every source master to stop."""
     for domain in domains:
         shutdown_requested.add(domain)
         run(virsh_command(args.libvirt_uri, "shutdown", domain))
@@ -620,17 +690,20 @@ def shutdown_domains(args, domains, shutdown_requested):
             time.sleep(2)
     if pending:
         raise CaptureError(
-            "VMs did not shut down before the timeout: " + ", ".join(sorted(pending))
+            "Some source VMs did not stop before the shutdown timeout; "
+            "recovery will wait once more, and manual follow-up may be required."
         )
 
 
 def domain_state(args, domain, *, timeout=10):
+    """Read the current libvirt state of one source domain."""
     return run(
         virsh_command(args.libvirt_uri, "domstate", domain), timeout=timeout
     ).decode().strip().lower()
 
 
 def wait_for_domain_states(args, domains, predicate, *, timeout, description):
+    """Wait a bounded time for source domains to reach a state."""
     pending = set(domains)
     last_state = {}
     deadline = time.monotonic() + timeout
@@ -663,6 +736,7 @@ def wait_for_domain_states(args, domains, predicate, *, timeout, description):
 
 
 def restart_domains(args, shutdown_requested):
+    """Restart stopped source VMs and report any recovery failures."""
     errors = []
     unresolved = wait_for_domain_states(
         args,
@@ -673,8 +747,8 @@ def restart_domains(args, shutdown_requested):
     )
     for domain, state in sorted(unresolved.items()):
         errors.append(
-            f"{domain}: did not reach shut off during recovery "
-            f"(last state: {state}); it may power off after the script exits"
+            "A source VM did not reach the stopped state during recovery; "
+            "manual follow-up is required because it may power off after the script exits."
         )
 
     stopped = set(shutdown_requested) - set(unresolved)
@@ -710,15 +784,19 @@ def restart_domains(args, shutdown_requested):
 
 
 def capture_disks(args, plan, stage_dir):
+    """Convert and verify all six source disks as standalone images."""
     for index, target, filename, _kind in DISK_LAYOUT:
         source = plan[(index, target)]["path"]
         destination = stage_dir / filename
         print(
-            f"Capturing {filename} from {source} "
+            f"Capturing {filename} "
             f"({plan[(index, target)]['info'].get('virtual-size', 0) // 1024**3} GiB)...",
             flush=True,
         )
-        run_visible(["qemu-img", "convert", "-p", "-O", "qcow2", source, destination])
+        run_visible(
+            ["qemu-img", "convert", "-p", "-O", "qcow2", source, destination],
+            timeout=3600,
+        )
         run(["qemu-img", "check", "-f", "qcow2", destination])
         output_info = image_info(destination)
         expected_size = plan[(index, target)]["info"]["virtual-size"]
@@ -738,34 +816,48 @@ def capture_disks(args, plan, stage_dir):
 
 
 def ensure_free_space(data_dir, plan):
-    total = sum(
-        int(item["info"].get("actual-size", item["info"].get("virtual-size", 0)))
-        for item in plan.values()
-    )
+    """Require capacity for materializing all source disks plus a safety margin."""
+    total = sum(int(item["info"]["virtual-size"]) for item in plan.values())
     required = int(total * 1.15) + 1024**3
     usage = shutil.disk_usage(data_dir)
     if usage.free < required:
         raise CaptureError(
-            f"Not enough free space under {data_dir}: need about "
+            f"Not enough free space for capture: need about "
             f"{required / 1024**3:.1f} GiB, have {usage.free / 1024**3:.1f} GiB"
         )
     print(
-        f"Capture space check: about {total / 1024**3:.1f} GiB of source data; "
-        f"{usage.free / 1024**3:.1f} GiB available."
+        f"Capture capacity estimate: {total / 1024**3:.1f} GiB of virtual disk "
+        f"capacity; {usage.free / 1024**3:.1f} GiB available."
     )
 
 
 def save_state_atomic(config_dir, state):
+    """Atomically save state while keeping it readable by the invoking user."""
     target = config_dir / "state.json"
+    try:
+        existing_stat = target.stat()
+    except FileNotFoundError:
+        existing_stat = None
+    mode = stat.S_IMODE(existing_stat.st_mode) if existing_stat else 0o600
     fd, temp_name = tempfile.mkstemp(prefix=".state-", dir=config_dir)
     try:
-        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w") as output:
+            sudo_uid = os.environ.get("SUDO_UID")
+            sudo_gid = os.environ.get("SUDO_GID")
+            if os.geteuid() == 0:
+                if sudo_uid is not None and sudo_gid is not None:
+                    os.fchown(output.fileno(), int(sudo_uid), int(sudo_gid))
+                elif existing_stat is not None:
+                    os.fchown(
+                        output.fileno(), existing_stat.st_uid, existing_stat.st_gid
+                    )
+            os.fchmod(output.fileno(), mode)
             json.dump(state, output, indent=2)
             output.write("\n")
             output.flush()
             os.fsync(output.fileno())
         os.replace(temp_name, target)
+        restore_invoking_user_ownership(target)
         directory_fd = os.open(config_dir, os.O_DIRECTORY)
         try:
             os.fsync(directory_fd)
@@ -777,6 +869,7 @@ def save_state_atomic(config_dir, state):
 
 
 def restore_invoking_user_ownership(path):
+    """Restore ownership to the user who invoked sudo."""
     if os.geteuid() != 0:
         return
     sudo_uid = os.environ.get("SUDO_UID")
@@ -792,7 +885,9 @@ def restore_invoking_user_ownership(path):
 
 
 def register_flavor(state_dir, lock_dir, stage_dir, flavor_name, metadata):
+    """Lock, save, and atomically register the captured flavor."""
     state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    restore_invoking_user_ownership(state_dir)
     lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(lock_dir, 0o700)
     restore_invoking_user_ownership(lock_dir)
@@ -831,6 +926,7 @@ def register_flavor(state_dir, lock_dir, stage_dir, flavor_name, metadata):
 
 
 def main():
+    """Run the capture workflow and register the resulting compact flavor."""
     args = parse_args()
     validate_args(args)
     if os.geteuid() != 0:
@@ -871,13 +967,18 @@ def main():
             shutdown_domains(args, domains, shutdown_requested)
             capture_disks(args, plan, stage_dir)
         finally:
+            original_error = sys.exc_info()[1]
             restart_errors = restart_domains(args, shutdown_requested)
             restarted = not restart_errors
             if restart_errors:
-                raise CaptureError(
+                message = (
                     "Failed to restore one or more source VMs:\n  "
                     + "\n  ".join(restart_errors)
                 )
+                if original_error is not None:
+                    message += f"\nOriginal capture failure: {original_error}"
+                    raise CaptureError(message) from original_error
+                raise CaptureError(message)
 
         disk_names = [entry[2] for entry in DISK_LAYOUT]
         metadata = {
@@ -906,6 +1007,7 @@ def main():
 
 
 def handle_termination(_signum, _frame):
+    """Turn SIGTERM into an interrupt so normal cleanup can run."""
     raise KeyboardInterrupt
 
 
