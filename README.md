@@ -119,7 +119,8 @@ sudo ./cluster-tool setup client
 
 # Pull a flavor from Quay and boot it
 ./cluster-tool pull quay.io/myorg/cluster-flavors:osac-vmaas
-./cluster-tool boot --flavor osac-vmaas --name my-test
+./cluster-tool boot --flavor osac-vmaas --name my-test \
+  --pull-secret /path/to/pull-secret.json
 
 # Use it
 export KUBECONFIG=~/.kube/my-test.kubeconfig
@@ -136,7 +137,8 @@ Only needed if you need a custom cluster configuration that doesn't exist as a p
 # The source ID is the 8 hex chars: 6ef80144
 
 ./cluster-tool snapshot --name my-flavor --source 6ef80144
-./cluster-tool boot --flavor my-flavor --name my-test
+./cluster-tool boot --flavor my-flavor --name my-test \
+  --pull-secret /path/to/pull-secret.json
 ```
 
 ## Quick Start
@@ -150,7 +152,8 @@ sudo ./cluster-tool setup client
 
 # Pull a pre-built flavor and boot (~15-20 min total)
 ./cluster-tool pull quay.io/myorg/cluster-flavors:osac-vmaas
-./cluster-tool boot --flavor osac-vmaas --name my-test
+./cluster-tool boot --flavor osac-vmaas --name my-test \
+  --pull-secret /path/to/pull-secret.json
 
 # Use it
 export KUBECONFIG=~/.kube/my-test.kubeconfig
@@ -158,7 +161,8 @@ oc get nodes
 
 # Or create your own flavor from a running SNO cluster
 ./cluster-tool snapshot --name sno-64 --source 6ef80144
-./cluster-tool boot --flavor sno-64 --name my-test-2
+./cluster-tool boot --flavor sno-64 --name my-test-2 \
+  --pull-secret /path/to/pull-secret.json
 
 # Push to Quay for distribution
 ./cluster-tool push sno-64 --registry quay.io/myorg/cluster-flavors --tag sno-64
@@ -166,7 +170,8 @@ oc get nodes
 # On another machine: pull and boot
 ./cluster-tool connect other-server --host root@other.example.com --data-path /home/cluster-tool
 ./cluster-tool pull --server other-server quay.io/myorg/cluster-flavors:sno-64
-./cluster-tool boot --server other-server --flavor sno-64 --name remote-test
+./cluster-tool boot --server other-server --flavor sno-64 --name remote-test \
+  --pull-secret /path/to/pull-secret.json
 
 # Tear down
 ./cluster-tool destroy my-test
@@ -189,10 +194,12 @@ cluster-tool manages multiple baremetal servers. Connect once, use by alias.
 ./cluster-tool use rdu
 
 # Target a specific server with --server
-./cluster-tool boot --server dell --flavor sno-cnv --name my-test
+./cluster-tool boot --server dell --flavor sno-cnv --name my-test \
+  --pull-secret /path/to/pull-secret.json
 
 # Without --server, uses the default
-./cluster-tool boot --flavor sno-cnv --name my-test
+./cluster-tool boot --flavor sno-cnv --name my-test \
+  --pull-secret /path/to/pull-secret.json
 ```
 
 For CI, use `local` as the host when running directly on the baremetal machine:
@@ -209,7 +216,7 @@ For CI, use `local` as the host when running directly on the baremetal machine:
 | `servers` | List all connected servers with default marker. |
 | `use NAME` | Set the default server. |
 | `snapshot --name NAME --source ID` | Create a snapshot flavor from a running cluster. Flattens disks, extracts crypto keys, injects SSH key. The private key is stored in the flavor's `crypto/` dir and travels with push/pull. |
-| `boot --flavor NAME [--name ID] [--server S]` | Boot a fresh clone. Creates overlays, networks, runs recert, waits for operators. If `--name` is omitted, a random 8-character hex ID is generated. |
+| `boot --flavor NAME --pull-secret FILE [--name ID] [--server S]` | Boot a fresh SNO clone. Creates overlays, networks, runs recert, waits for operators, and injects the required pull secret. If `--name` is omitted, a random 8-character hex ID is generated. |
 | `list [--server S]` | Show running clones. |
 | `flavors [--delete NAME] [--server S]` | List or delete flavors. |
 | `verify ID [--server S]` | Deploys a test pod that checks cluster DNS, external DNS resolution, and API access via service account. Reports PASS/FAIL per check. |
@@ -273,7 +280,8 @@ Flavors are distributed as OCI container images via any registry (Quay.io, Docke
 ./cluster-tool pull --server target quay.io/myorg/flavors:sno-cnv
 
 # Boot from the pulled flavor
-./cluster-tool boot --server target --flavor sno-cnv --name my-clone
+./cluster-tool boot --server target --flavor sno-cnv --name my-clone \
+  --pull-secret /path/to/pull-secret.json
 ```
 
 Measured timings (SNO with CNV+LVMS, 90 GB disk):
@@ -360,9 +368,9 @@ Client (laptop)                      Server (baremetal)
 
 ## Networking
 
-Clones are assigned subnets sequentially starting from `192.168.160.0/24`. Each clone uses one primary subnet plus a secondary subnet at +18. Subnets are never reused automatically, so the practical limit is ~90 clones per server before the `192.168.x` range is exhausted. Destroyed clones do not free their subnet.
+The allocator scans candidate subnets starting at `192.168.160.0/24`. SNO clones reserve the candidate subnet and the subnet 18 higher; compact clones use one subnet for all three VMs. Because the SNO subnet pairs overlap in the available range, an otherwise unreserved server can fit up to 42 SNO allocations. Existing flavors and clones reduce that capacity.
 
-If you hit the limit, destroy all clones and manually reset the counter by editing `state.json` on the server (set `next_subnet` back to `160`).
+The allocator chooses the first available subnet pair. Destroying a clone frees its recorded subnet allocation for reuse. A flavor's source subnets remain reserved while that flavor exists. If the allocator reports that no subnets are available, remove unused clones with `destroy` or unused flavors with `flavors --delete`; there is no persistent `next_subnet` counter to reset.
 
 ## Cross-Machine Boot
 
