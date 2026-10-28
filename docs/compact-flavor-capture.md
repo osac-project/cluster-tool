@@ -64,9 +64,11 @@ Have the following information ready:
 
 The source VMs must be running when you start. The capture gracefully shuts
 down all three VMs while copying disks, so the source cluster will be
-unavailable for several minutes. The script attempts to restart the VMs after
-capture, including when disk capture fails. If a restart fails, it reports the
-affected VM and preserves the staging directory. The script never
+unavailable for several minutes. The script tracks every VM sent a shutdown
+request, waits for it to stop, restarts it, and confirms it returns to a
+running state, including when disk capture fails. If recovery times out, it
+reports the unresolved VM and preserves the staging directory; a VM still
+shutting down may power off after the script exits. The script never
 force-powers VMs off.
 
 ## Capture the flavor
