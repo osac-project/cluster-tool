@@ -950,9 +950,21 @@ def ensure_libvirt_account():
 
 
 def ensure_free_space(destination_dir, plan):
-    """Require capacity on the flavor destination filesystem plus a safety margin."""
-    total = sum(int(item["info"]["virtual-size"]) for item in plan.values())
-    required = int(total * 1.15) + 1024**3
+    """Estimate capture output from allocated source data plus a safety margin."""
+    allocated_total = 0
+    virtual_total = 0
+    virtual_size_fallbacks = 0
+    for item in plan.values():
+        info = item["info"]
+        virtual_size = int(info["virtual-size"])
+        allocated_size = info.get("actual-size")
+        if not isinstance(allocated_size, int) or allocated_size <= 0:
+            allocated_size = virtual_size
+            virtual_size_fallbacks += 1
+        allocated_total += allocated_size
+        virtual_total += virtual_size
+
+    required = int(allocated_total * 1.15) + 1024**3
     usage = shutil.disk_usage(destination_dir)
     if usage.free < required:
         raise CaptureError(
@@ -960,9 +972,15 @@ def ensure_free_space(destination_dir, plan):
             f"{required / 1024**3:.1f} GiB, have {usage.free / 1024**3:.1f} GiB"
         )
     print(
-        f"Capture capacity estimate: {total / 1024**3:.1f} GiB of virtual disk "
-        f"capacity; {usage.free / 1024**3:.1f} GiB available."
+        f"Capture estimate: {allocated_total / 1024**3:.1f} GiB allocated "
+        f"across source disks (virtual capacity {virtual_total / 1024**3:.1f} GiB); "
+        f"{usage.free / 1024**3:.1f} GiB available."
     )
+    if virtual_size_fallbacks:
+        print(
+            f"Used virtual-size fallback for {virtual_size_fallbacks} disk(s) "
+            "without a valid actual-size value."
+        )
 
 
 def save_state_atomic(config_dir, state):
