@@ -10,6 +10,7 @@ import json
 import os
 import pwd
 import re
+import selectors
 import shutil
 import signal
 import stat
@@ -85,23 +86,75 @@ def run(command, *, timeout=60, input_bytes=None):
     return result.stdout
 
 
-def run_visible(command, *, timeout=3600):
-    """Run a command without forwarding tool output that may contain host details."""
+def run_visible(command, *, timeout=3600, progress_interval=30):
+    """Run a conversion while reporting only safe progress and elapsed time."""
+    label = display_command(command)
+    started = time.monotonic()
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             [str(part) for part in command],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
-            timeout=timeout,
+            bufsize=0,
         )
-    except subprocess.TimeoutExpired as error:
-        raise CaptureError(
-            f"Command timed out after {timeout} seconds: {display_command(command)}"
-        ) from error
-    if result.returncode:
-        raise CaptureError(
-            f"Command failed ({result.returncode}): {display_command(command)}"
-        )
+    except OSError as error:
+        raise CaptureError(f"Could not start {label}") from error
+
+    selector = selectors.DefaultSelector()
+    selector.register(process.stderr, selectors.EVENT_READ)
+    progress_buffer = b""
+    last_percent = -1
+    next_status = started + progress_interval
+    try:
+        while process.poll() is None or selector.get_map():
+            now = time.monotonic()
+            elapsed = now - started
+            if elapsed >= timeout:
+                raise CaptureError(f"Command timed out after {timeout} seconds: {label}")
+
+            wait_time = min(1.0, timeout - elapsed, max(0.0, next_status - now))
+            for key, _ in selector.select(wait_time):
+                chunk = os.read(key.fileobj.fileno(), 4096)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                    continue
+                progress_buffer = (progress_buffer + chunk)[-256:]
+                for match in re.finditer(
+                    rb"\(\s*(\d+(?:\.\d+)?)/100%\s*\)", progress_buffer
+                ):
+                    percent = int(float(match.group(1)))
+                    if percent != last_percent:
+                        print(f"  qemu-img convert {percent}%", flush=True)
+                        last_percent = percent
+                        next_status = time.monotonic() + progress_interval
+
+            now = time.monotonic()
+            if process.poll() is None and now >= next_status:
+                print(
+                    f"  {label} still running after {now - started:.0f}s",
+                    flush=True,
+                )
+                next_status = now + progress_interval
+
+        return_code = process.wait()
+    except BaseException:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        raise
+    finally:
+        selector.close()
+        if process.stderr and not process.stderr.closed:
+            process.stderr.close()
+
+    if return_code:
+        raise CaptureError(f"Command failed ({return_code}): {label}")
+    return time.monotonic() - started
 
 
 def require_programs(names):
@@ -316,7 +369,7 @@ def node_label(name):
 
 def vm_label(domain):
     """Return an opaque index for a source VM."""
-    match = re.search(r"-master-0-(\d+)$", domain)
+    match = re.search(r"(?:^|-)master-0-(\d+)$", domain)
     return f"VM {match.group(1)}" if match else "source VM"
 
 
@@ -647,6 +700,11 @@ def collect_source_plan(args):
             ("vdb", args.expected_spare_disk_gib),
         ):
             info = image_info(disks[target])
+            if info.get("backing-filename"):
+                raise CaptureError(
+                    f"Disk {target} for {vm_label(domain)} uses a backing file; "
+                    "flatten or consolidate the disk before capture"
+                )
             expected_bytes = expected_gib * 1024**3
             if info.get("virtual-size") != expected_bytes:
                 raise CaptureError(
@@ -930,22 +988,46 @@ def restart_domains(args, shutdown_requested):
 
 
 def capture_disks(args, plan, stage_dir):
-    """Convert and verify all six source disks as standalone images."""
+    """Capture and verify all six source disks as standalone images."""
     for index, target, filename, _kind in DISK_LAYOUT:
-        source = plan[(index, target)]["path"]
+        item = plan[(index, target)]
+        source = item["path"]
+        source_info = item["info"]
         destination = stage_dir / filename
         disk_number = index * 2 + (1 if target == "vdb" else 0) + 1
+        disk_started = time.monotonic()
         print(
             f"Capturing disk {disk_number}/6 "
-            f"({plan[(index, target)]['info'].get('virtual-size', 0) // 1024**3} GiB)...",
+            f"({source_info.get('virtual-size', 0) // 1024**3} GiB)...",
             flush=True,
         )
         previous_umask = os.umask(0o077)
         try:
-            run_visible(
-                ["qemu-img", "convert", "-p", "-O", "qcow2", source, destination],
-                timeout=3600,
-            )
+            method = "convert"
+            if source_info.get("format") == "qcow2":
+                try:
+                    result = subprocess.run(
+                        ["cp", "--reflink=always", "--", str(source), str(destination)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=60,
+                    )
+                    if result.returncode == 0:
+                        method = "reflink"
+                    else:
+                        destination.unlink(missing_ok=True)
+                except (OSError, subprocess.TimeoutExpired):
+                    destination.unlink(missing_ok=True)
+                if method == "convert":
+                    print(
+                        "  reflink unavailable; using qemu-img convert",
+                        flush=True,
+                    )
+            if method == "convert":
+                run_visible(
+                    ["qemu-img", "convert", "-p", "-O", "qcow2", source, destination],
+                    timeout=3600,
+                )
         finally:
             os.umask(previous_umask)
         run(["qemu-img", "check", "-f", "qcow2", destination])
@@ -955,6 +1037,9 @@ def capture_disks(args, plan, stage_dir):
             raise CaptureError(f"Captured disk {disk_number} has an unexpected virtual size")
         if output_info.get("backing-filename"):
             raise CaptureError(f"Captured disk {disk_number} still has a backing file")
+        allocated_size = output_info.get("actual-size")
+        if not isinstance(allocated_size, int) or allocated_size < 0:
+            allocated_size = destination.stat().st_blocks * 512
         try:
             shutil.chown(destination, user="qemu", group="qemu")
         except (LookupError, PermissionError):
@@ -962,7 +1047,12 @@ def capture_disks(args, plan, stage_dir):
                 "Could not set captured disks to the libvirt service account"
             )
         os.chmod(destination, 0o640)
-        print(f"  verified disk {disk_number}/6", flush=True)
+        print(
+            f"  verified disk {disk_number}/6 via {method}: "
+            f"{allocated_size / 1024**3:.1f} GiB allocated, "
+            f"{time.monotonic() - disk_started:.1f}s",
+            flush=True,
+        )
 
 
 def ensure_libvirt_account():
@@ -1154,6 +1244,7 @@ def register_flavor(state_dir, lock_dir, stage_dir, flavor_name, metadata):
 
 def main():
     """Run the capture workflow and register the resulting compact flavor."""
+    workflow_started = time.monotonic()
     args = parse_args()
     validate_args(args)
     if os.geteuid() != 0:
@@ -1225,6 +1316,11 @@ def main():
         registered = register_flavor(state_dir, lock_dir, stage_dir, args.flavor, metadata)
         stage_dir = None
         print("\nFlavor capture and registration completed successfully.")
+        print(f"Total elapsed time: {time.monotonic() - workflow_started:.1f}s.")
+        print(
+            "The source VMs were verified running; this does not wait for the "
+            "OpenShift nodes or operators to become Ready."
+        )
         print("Inspect the local flavor, then push it with cluster-tool.")
     finally:
         if stage_dir and stage_dir.exists():
