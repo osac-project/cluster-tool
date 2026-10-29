@@ -35,7 +35,8 @@ directory for locking. Required commands are virsh, qemu-img, oc, ssh, ssh-keyge
 
 The defaults match the MNO flavor we created in this session:
 
-- Three domains named <vm-prefix>-master-0-0, -master-0-1, and -master-0-2
+- Three domains named master-0-0, master-0-1, and master-0-2 by default;
+  an optional prefix can be added before the node name
 - 24 GiB RAM and 12 vCPUs per master
 - 80 GiB vda OS disk and 132 GiB vdb spare disk per master
 - A healthy cluster: all three nodes Ready, ClusterOperators available and
@@ -47,8 +48,9 @@ uses different VM or disk sizes, pass the corresponding --expected-* options.
 
 Have the following information ready:
 
-- The VM name prefix. For example, if your domains are
-  cluster-master-0-0 through cluster-master-0-2, use cluster.
+- The optional VM name prefix. Domains named master-0-0 through
+  master-0-2 need no prefix. For names like cluster-master-0-0 through
+  cluster-master-0-2, pass --vm-prefix cluster.
 - The source primary subnet's third octet (for example, 123 for
   192.168.123.0/24). The script checks that the API address and all three
   node InternalIPs are inside 192.168.<octet>.0/24 before capture.
@@ -81,15 +83,15 @@ timeout.
 
 ## Capture the flavor
 
-Replace the example cluster name, VM prefix, IPs, subnet, and paths with those
-for your source cluster.
+Replace the example cluster name, IPs, subnet, and paths with those for your
+source cluster. If the VM names have a prefix before master-0-N, pass it with
+--vm-prefix; otherwise omit that option.
 
     cd /path/to/cluster-tool
 
     ./scripts/capture_compact_flavor.py \
       --flavor mno-3node-24gb \
       --source-cluster assisted-cluster \
-      --vm-prefix assisted-cluster \
       --source-primary-subnet 123 \
       --api-address 192.168.123.10 \
       --api-server-name api.assisted.example.com \
