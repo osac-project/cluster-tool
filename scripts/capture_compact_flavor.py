@@ -116,7 +116,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Capture a healthy, bare three-node compact OpenShift cluster into "
-            "a cluster-tool flavor directory and register it for push."
+            "a local cluster-tool flavor; it does not upload the flavor."
         )
     )
     parser.add_argument("--flavor", required=True, help="New local flavor name")
@@ -127,8 +127,11 @@ def parse_args():
     )
     parser.add_argument(
         "--vm-prefix",
-        required=True,
-        help="Prefix of source libvirt domains, before '-master-0-N'",
+        default="",
+        help=(
+            "Optional prefix of source libvirt domains before '-master-0-N'; "
+            "omit it for master-0-0 through master-0-2"
+        ),
     )
     parser.add_argument(
         "--source-primary-subnet",
@@ -212,12 +215,17 @@ def validate_args(args):
     for label, value in (
         ("flavor", args.flavor),
         ("source-cluster", args.source_cluster),
-        ("vm-prefix", args.vm_prefix),
     ):
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value):
             raise CaptureError(
                 f"--{label} must contain only letters, digits, '.', '_' or '-'"
             )
+    if args.vm_prefix and not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9_.-]*", args.vm_prefix
+    ):
+        raise CaptureError(
+            "--vm-prefix must contain only letters, digits, '.', '_' or '-'"
+        )
     if not 1 <= args.source_primary_subnet <= 254:
         raise CaptureError("--source-primary-subnet must be between 1 and 254")
     try:
@@ -589,7 +597,11 @@ def collect_source_plan(args):
     plan = {}
     expected_memory = args.expected_memory_gib * 1024 * 1024
     for index in range(3):
-        domain = f"{args.vm_prefix}-master-0-{index}"
+        domain = (
+            f"{args.vm_prefix}-master-0-{index}"
+            if args.vm_prefix
+            else f"master-0-{index}"
+        )
         domains.append(domain)
         vcpus, memory_kib = parse_dominfo(
             run(virsh_command(args.libvirt_uri, "dominfo", domain)), domain
