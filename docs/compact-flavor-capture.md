@@ -65,21 +65,13 @@ Have the following information ready:
   non-interactively and have mode 0600. Its matching .pub file must be next
   to it unless --ssh-public-key is provided.
 - Enough free space on the filesystem that contains the configured
-  CLUSTER_TOOL_DATA/flavors directory. The preflight sums each source disk's
-  qemu-img `actual-size` when available, falling back to its virtual size if
-  the allocated size is missing or invalid. It requires a 15% margin plus
-  1 GiB. The captured qcow2 files can be smaller when the source contains
-  sparse or zero-filled regions.
+  CLUSTER_TOOL_DATA/flavors directory. The preflight sums each standalone source disk's qemu-img `actual-size` when available, falling back to its virtual size if the allocated size is missing or invalid. It requires a 15% margin plus 1 GiB. Disks with backing files are rejected before downtime so the estimate cannot omit allocated data from a backing layer; flatten or consolidate those disks first. The captured qcow2 files can be smaller when the source contains sparse or zero-filled regions.
+
+For standalone qcow2 inputs, capture first tries a filesystem reflink. If the source and destination filesystems cannot reflink, it falls back to `qemu-img convert`. Conversion progress is shown as a percentage, and each verified disk reports its capture method, allocated output size, and elapsed time.
 
 The source VMs must be running when you start. The capture gracefully shuts
 down all three VMs while copying disks, so the source cluster will be
-unavailable for several minutes. The script tracks every VM sent a shutdown
-request, waits for it to stop, restarts it, and confirms it returns to a
-running state, including when disk capture fails. If recovery times out, it
-reports that manual follow-up is required and preserves the staging directory;
-a VM still shutting down may power off after the script exits. The script never
-force-powers VMs off. Credential extraction has a 60-second timeout, and each
-disk conversion has a one-hour timeout. The VMs are restarted after a conversion
+unavailable for several minutes. The script tracks every VM sent a shutdown request, waits for it to stop, restarts it, and confirms it returns to a running state, including when disk capture fails. If recovery times out, it reports that manual follow-up is required and preserves the staging directory; a VM still shutting down may power off after the script exits. The script never force-powers VMs off. It verifies libvirt reports the source VMs running before it finishes, but does not wait for OpenShift nodes or operators to become Ready. Credential extraction and each reflink attempt have a 60-second timeout; each disk conversion has a one-hour timeout. The VMs are restarted after a conversion timeout. The VMs are restarted after a conversion
 timeout.
 
 ## Capture the flavor
