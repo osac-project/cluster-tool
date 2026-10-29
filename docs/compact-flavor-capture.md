@@ -143,17 +143,22 @@ Check the actual flavor path if CLUSTER_TOOL_DATA is not
 
 ## Push to Quay
 
-The capture keeps private credentials root-only. Run the upload as root too;
-if you use sudo, use it for both login and push so the root account can read
-the captured flavor and its Podman credentials. cluster-tool push does not
-capture disks; it only packages and uploads an existing local flavor.
+The capture keeps private credentials root-only. Run both commands with root
+privileges while preserving the `HOME` used to configure cluster-tool. This
+lets the push command read the same flavor state and data directory as the
+capture. Run these commands from the account whose cluster-tool configuration
+you used (not from a root login shell); the shell expands `$HOME` before sudo:
 
-    podman login quay.io
+    sudo env HOME="$HOME" podman login quay.io
 
-    ./cluster-tool push mno-3node-24gb \
+    sudo env HOME="$HOME" ./cluster-tool push mno-3node-24gb \
       --registry quay.io/your-org/cluster-flavors \
       --tag mno-3node-24gb \
       --server local
+
+cluster-tool push does not capture disks; it only packages and uploads an
+existing local flavor. If cluster-tool was configured under root's home, run
+both commands directly as root instead.
 
 The resulting reference is
 quay.io/your-org/cluster-flavors:mno-3node-24gb. Restrict access to the
