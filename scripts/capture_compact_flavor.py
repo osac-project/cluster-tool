@@ -518,7 +518,7 @@ def domain_mac_addresses(uri, domain):
 
 def node_interface_mac(args, identity, node_name, node_ip):
     """Read the MAC address of the API node interface that owns its InternalIP."""
-    command = [
+    ssh = [
         "ssh",
         "-i",
         str(identity),
@@ -529,34 +529,61 @@ def node_interface_mac(args, identity, node_name, node_ip):
         "-o",
         "StrictHostKeyChecking=accept-new",
         f"core@{node_ip}",
-        "ip",
-        "-j",
-        "-4",
-        "address",
-        "show",
     ]
     try:
-        interfaces = json.loads(run(command, timeout=20))
+        interfaces = json.loads(
+            run(ssh + ["ip", "-j", "-4", "address", "show"], timeout=20)
+        )
     except (CaptureError, json.JSONDecodeError) as error:
         raise CaptureError(
             f"Could not verify network identity for {node_label(node_name)}"
         ) from error
-    matches = {
-        interface.get("address", "").lower()
+
+    matching_interfaces = [
+        interface
         for interface in interfaces
         if any(
             item.get("local") == node_ip
             for item in interface.get("addr_info", [])
         )
-        and interface.get("address")
-    }
-    if len(matches) != 1 or not re.fullmatch(
-        r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", next(iter(matches), "")
-    ):
+    ]
+    if len(matching_interfaces) != 1:
         raise CaptureError(
             f"Could not verify network identity for {node_label(node_name)}"
         )
-    return next(iter(matches))
+
+    interface = matching_interfaces[0]
+    mac = interface.get("address")
+    if not mac:
+        interface_name = interface.get("ifname")
+        if not interface_name:
+            raise CaptureError(
+                f"Could not verify network identity for {node_label(node_name)}"
+            )
+        try:
+            links = json.loads(
+                run(
+                    ssh
+                    + ["ip", "-j", "link", "show", "dev", interface_name],
+                    timeout=20,
+                )
+            )
+        except (CaptureError, json.JSONDecodeError) as error:
+            raise CaptureError(
+                f"Could not verify network identity for {node_label(node_name)}"
+            ) from error
+        if len(links) != 1 or links[0].get("ifname") != interface_name:
+            raise CaptureError(
+                f"Could not verify network identity for {node_label(node_name)}"
+            )
+        mac = links[0].get("address")
+
+    mac = mac.lower() if isinstance(mac, str) else ""
+    if not re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", mac):
+        raise CaptureError(
+            f"Could not verify network identity for {node_label(node_name)}"
+        )
+    return mac
 
 
 def verify_domain_node_bindings(args, domains, node_ips, identity):
