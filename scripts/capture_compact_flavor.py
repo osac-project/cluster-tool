@@ -4,9 +4,11 @@
 import argparse
 import base64
 import fcntl
+import grp
 import ipaddress
 import json
 import os
+import pwd
 import re
 import shutil
 import signal
@@ -924,6 +926,17 @@ def capture_disks(args, plan, stage_dir):
         print(f"  verified disk {disk_number}/6", flush=True)
 
 
+def ensure_libvirt_account():
+    """Require the account used to own captured disks before downtime."""
+    try:
+        pwd.getpwnam("qemu")
+        grp.getgrnam("qemu")
+    except KeyError as error:
+        raise CaptureError(
+            "The qemu user and group are required to own captured disks"
+        ) from error
+
+
 def ensure_free_space(destination_dir, plan):
     """Require capacity on the flavor destination filesystem plus a safety margin."""
     total = sum(int(item["info"]["virtual-size"]) for item in plan.values())
@@ -1108,6 +1121,7 @@ def main():
     domains, plan = collect_source_plan(args)
     verify_domain_node_bindings(args, domains, node_ips, identity)
     ensure_free_space(flavors_dir, plan)
+    ensure_libvirt_account()
 
     stage_dir = Path(
         tempfile.mkdtemp(prefix=f".{args.flavor}.capture-", dir=flavors_dir)
