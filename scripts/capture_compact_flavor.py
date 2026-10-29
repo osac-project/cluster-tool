@@ -84,9 +84,14 @@ def run(command, *, timeout=60, input_bytes=None):
 
 
 def run_visible(command, *, timeout=3600):
-    """Run a command with visible progress and a bounded timeout."""
+    """Run a command without forwarding tool output that may contain host details."""
     try:
-        result = subprocess.run([str(part) for part in command], timeout=timeout)
+        result = subprocess.run(
+            [str(part) for part in command],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
     except subprocess.TimeoutExpired as error:
         raise CaptureError(
             f"Command timed out after {timeout} seconds: {display_command(command)}"
@@ -223,7 +228,7 @@ def validate_args(args):
         args.api_address = str(api_address)
         args.ssh_node_ip = str(ssh_node_ip)
     except ValueError as error:
-        raise CaptureError(f"Invalid API or SSH IP address: {error}") from error
+        raise CaptureError("Invalid API or SSH address") from error
     if not re.fullmatch(r"[A-Za-z0-9.-]+", args.api_server_name):
         raise CaptureError("--api-server-name must be a DNS name, without scheme or port")
     if not args.kubeconfig:
@@ -291,6 +296,20 @@ def condition_map(conditions):
     return {condition.get("type"): condition.get("status") for condition in conditions}
 
 
+def node_label(name):
+    """Return an opaque index for a source node."""
+    try:
+        return f"node {NODE_NAMES.index(name)}"
+    except ValueError:
+        return "source node"
+
+
+def vm_label(domain):
+    """Return an opaque index for a source VM."""
+    match = re.search(r"-master-0-(\d+)$", domain)
+    return f"VM {match.group(1)}" if match else "source VM"
+
+
 def is_ipv4(address):
     """Return whether an address is a valid IPv4 address."""
     try:
@@ -305,10 +324,7 @@ def verify_cluster(args):
     nodes = oc_json(args, "get", "nodes", "-o", "json").get("items", [])
     by_name = {node.get("metadata", {}).get("name"): node for node in nodes}
     if set(by_name) != set(NODE_NAMES):
-        raise CaptureError(
-            "Expected exactly master-0-0, master-0-1, and master-0-2; found: "
-            + ", ".join(sorted(by_name))
-        )
+        raise CaptureError("Expected exactly three source masters")
     node_ips = {}
     for name in NODE_NAMES:
         node = by_name[name]
@@ -317,7 +333,7 @@ def verify_cluster(args):
             for condition in node.get("status", {}).get("conditions", [])
         )
         if not ready:
-            raise CaptureError(f"Source node {name} is not Ready")
+            raise CaptureError(f"{node_label(name)} is not Ready")
         addresses = [
             item.get("address")
             for item in node.get("status", {}).get("addresses", [])
@@ -325,7 +341,7 @@ def verify_cluster(args):
         ]
         ipv4_addresses = [address for address in addresses if is_ipv4(address)]
         if not ipv4_addresses:
-            raise CaptureError(f"Could not find an IPv4 InternalIP for {name}")
+            raise CaptureError(f"Could not find an IPv4 address for {node_label(name)}")
         node_ips[name] = ipv4_addresses[0]
 
     source_network = ipaddress.ip_network(
@@ -334,8 +350,7 @@ def verify_cluster(args):
     source_addresses = [args.api_address, *node_ips.values()]
     if any(ipaddress.ip_address(address) not in source_network for address in source_addresses):
         raise CaptureError(
-            "The API and all source node addresses must match "
-            "--source-primary-subnet (192.168.<octet>.0/24)"
+            "The API and all source node addresses must match the configured source subnet"
         )
 
     namespaces = oc_json(args, "get", "namespaces", "-o", "json").get("items", [])
@@ -352,8 +367,8 @@ def verify_cluster(args):
             add_on_namespaces.append(name)
     if add_on_namespaces:
         raise CaptureError(
-            "Source is not a bare OpenShift snapshot; remove these add-on namespaces "
-            "before capture: " + ", ".join(sorted(add_on_namespaces))
+            "Source is not a bare OpenShift snapshot; remove the detected add-ons "
+            "before capture"
         )
 
     operators = oc_json(args, "get", "co", "-o", "json").get("items", [])
@@ -369,7 +384,7 @@ def verify_cluster(args):
             unhealthy.append(name)
     if unhealthy:
         raise CaptureError(
-            "ClusterOperators are not quiet and healthy: " + ", ".join(unhealthy)
+            "One or more ClusterOperators are not quiet and healthy"
         )
 
     mcp = oc_json(args, "get", "mcp", "master", "-o", "json")
@@ -394,10 +409,10 @@ def verify_cluster(args):
             "json",
         )
         if pod.get("status", {}).get("phase") != "Running":
-            raise CaptureError(f"etcd pod etcd-{node_name} is not Running")
+            raise CaptureError(f"etcd pod for {node_label(node_name)} is not Running")
         statuses = pod.get("status", {}).get("containerStatuses", [])
         if not statuses or any(not item.get("ready") for item in statuses):
-            raise CaptureError(f"etcd pod etcd-{node_name} is not fully Ready")
+            raise CaptureError(f"etcd pod for {node_label(node_name)} is not fully Ready")
         image = next(
             (
                 item.get("image")
@@ -407,7 +422,7 @@ def verify_cluster(args):
             None,
         )
         if not image:
-            raise CaptureError(f"Could not determine etcd image from etcd-{node_name}")
+            raise CaptureError(f"Could not determine the etcd image for {node_label(node_name)}")
         if etcd_image is None:
             etcd_image = image
         elif image != etcd_image:
@@ -431,12 +446,12 @@ def parse_dominfo(output, domain):
             fields[key.strip()] = value.strip()
     state = fields.get("State", "").lower()
     if state != "running":
-        raise CaptureError(f"Source VM {domain} is {state or 'in an unknown state'}, not running")
+        raise CaptureError(f"{vm_label(domain)} is not running")
     try:
         vcpus = int(fields["CPU(s)"])
         memory_kib = int(fields["Max memory"].split()[0])
     except (KeyError, ValueError) as error:
-        raise CaptureError(f"Could not read CPU and memory from virsh dominfo for {domain}") from error
+        raise CaptureError(f"Could not read CPU and memory for {vm_label(domain)}") from error
     return vcpus, memory_kib
 
 
@@ -462,18 +477,100 @@ def resolve_domain_disks(uri, domain):
                 virsh_command(uri, "vol-path", "--pool", source["pool"], source["volume"])
             ).decode().strip()
         else:
-            raise CaptureError(f"Unsupported source for {domain} disk {target}")
+            raise CaptureError(f"Unsupported disk source for {vm_label(domain)} {target}")
         if target in result:
-            raise CaptureError(f"Duplicate disk target {target} in {domain}")
+            raise CaptureError(f"Duplicate disk target {target} in {vm_label(domain)}")
         if not Path(path).exists():
-            raise CaptureError(f"Disk path for {domain} {target} does not exist: {path}")
+            raise CaptureError(f"Disk {target} for {vm_label(domain)} does not exist")
         result[target] = Path(path)
     if set(result) != {"vda", "vdb"}:
         raise CaptureError(
-            f"{domain} must have exactly vda (OS) and vdb (spare); found "
+            f"{vm_label(domain)} must have exactly vda (OS) and vdb (spare); found "
             + ", ".join(sorted(result))
         )
     return result
+
+
+def domain_mac_addresses(uri, domain):
+    """Read interface MAC addresses configured on a libvirt domain."""
+    try:
+        xml = ET.fromstring(run(virsh_command(uri, "dumpxml", domain)))
+    except ET.ParseError as error:
+        raise CaptureError(
+            f"Could not read network identity for {vm_label(domain)}"
+        ) from error
+    return {
+        element.get("address", "").lower()
+        for element in xml.findall("./devices/interface/mac")
+        if element.get("address")
+    }
+
+
+def node_interface_mac(args, identity, node_name, node_ip):
+    """Read the MAC address of the API node interface that owns its InternalIP."""
+    command = [
+        "ssh",
+        "-i",
+        str(identity),
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        f"core@{node_ip}",
+        "ip",
+        "-j",
+        "-4",
+        "address",
+        "show",
+    ]
+    try:
+        interfaces = json.loads(run(command, timeout=20))
+    except (CaptureError, json.JSONDecodeError) as error:
+        raise CaptureError(
+            f"Could not verify network identity for {node_label(node_name)}"
+        ) from error
+    matches = {
+        interface.get("address", "").lower()
+        for interface in interfaces
+        if any(
+            item.get("local") == node_ip
+            for item in interface.get("addr_info", [])
+        )
+        and interface.get("address")
+    }
+    if len(matches) != 1 or not re.fullmatch(
+        r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", next(iter(matches), "")
+    ):
+        raise CaptureError(
+            f"Could not verify network identity for {node_label(node_name)}"
+        )
+    return next(iter(matches))
+
+
+def verify_domain_node_bindings(args, domains, node_ips, identity):
+    """Require each source VM MAC to match the API node at the same index."""
+    if len(set(node_ips.values())) != len(NODE_NAMES):
+        raise CaptureError("Source API nodes do not have unique IPv4 addresses")
+    node_macs = {
+        name: node_interface_mac(args, identity, name, address)
+        for name, address in node_ips.items()
+    }
+    if len(set(node_macs.values())) != len(NODE_NAMES):
+        raise CaptureError("Source API nodes do not have unique network identities")
+    for index, domain in enumerate(domains):
+        try:
+            macs = domain_mac_addresses(args.libvirt_uri, domain)
+        except CaptureError as error:
+            raise CaptureError(
+                f"Could not verify network identity for VM {index}"
+            ) from error
+        if node_macs[NODE_NAMES[index]] not in macs:
+            raise CaptureError(
+                f"VM {index} does not match the expected API node; refusing capture"
+            )
+    print("Confirmed each capture VM matches its API node.")
 
 
 def image_info(path):
@@ -497,11 +594,11 @@ def collect_source_plan(args):
         )
         if vcpus != args.expected_vcpus:
             raise CaptureError(
-                f"{domain} has {vcpus} vCPUs; expected {args.expected_vcpus}"
+                f"{vm_label(domain)} has an unexpected vCPU count"
             )
         if memory_kib != expected_memory:
             raise CaptureError(
-                f"{domain} has {memory_kib} KiB RAM; expected {expected_memory} KiB"
+                f"{vm_label(domain)} has an unexpected memory size"
             )
         disks = resolve_domain_disks(args.libvirt_uri, domain)
         for target, expected_gib in (
@@ -512,8 +609,7 @@ def collect_source_plan(args):
             expected_bytes = expected_gib * 1024**3
             if info.get("virtual-size") != expected_bytes:
                 raise CaptureError(
-                    f"{domain} {target} is {info.get('virtual-size')} bytes; "
-                    f"expected {expected_bytes} ({expected_gib} GiB)"
+                    f"Disk {target} for {vm_label(domain)} has an unexpected size"
                 )
             plan[(index, target)] = {
                 "domain": domain,
@@ -530,22 +626,24 @@ def collect_source_plan(args):
 
 
 def preflight_ssh(args, public_key, node_ips):
-    """Verify non-interactive core SSH access to every source master."""
+    """Verify SSH access and read each source node's interface identity."""
     identity = Path(args.ssh_identity).expanduser()
     if not identity.is_file():
-        raise CaptureError(f"SSH identity does not exist: {identity}")
+        raise CaptureError("SSH private identity file is missing")
     if not public_key.is_file():
-        raise CaptureError(f"SSH public key does not exist: {public_key}")
+        raise CaptureError("SSH public identity file is missing")
     if stat.S_IMODE(identity.stat().st_mode) & 0o077:
         raise CaptureError(
-            f"SSH identity permissions are too open: {identity}; run chmod 600 on it"
+            "SSH identity permissions are too open; run chmod 600 on the private key"
         )
     derived_key = run(["ssh-keygen", "-y", "-P", "", "-f", identity]).decode().strip().split()
     supplied_key = public_key.read_text().strip().split()
     if len(derived_key) < 2 or len(supplied_key) < 2 or derived_key[:2] != supplied_key[:2]:
-        raise CaptureError(f"SSH public key does not match private identity: {public_key}")
-    node_ips["master-0-0"] = args.ssh_node_ip
+        raise CaptureError("SSH public key does not match the private identity")
     for node_name in NODE_NAMES:
+        ssh_address = (
+            args.ssh_node_ip if node_name == "master-0-0" else node_ips[node_name]
+        )
         command = [
             "ssh",
             "-i",
@@ -556,15 +654,15 @@ def preflight_ssh(args, public_key, node_ips):
             "ConnectTimeout=10",
             "-o",
             "StrictHostKeyChecking=accept-new",
-            f"core@{node_ips[node_name]}",
+            f"core@{ssh_address}",
             "true",
         ]
         try:
             run(command, timeout=20)
         except CaptureError as error:
             raise CaptureError(
-                f"SSH preflight failed for {node_name}. The key must already be "
-                "trusted by core on all three masters."
+                f"SSH preflight failed for {node_label(node_name)}. The key must "
+                "already be trusted by core on all three masters."
             ) from error
     print("SSH key access verified on all three masters.")
 
@@ -575,7 +673,7 @@ def create_private_file(path, data, mode=0o600):
     with os.fdopen(descriptor, "wb") as output:
         output.write(data)
     if path.stat().st_size == 0:
-        raise CaptureError(f"Refusing to keep an empty credential file: {path.name}")
+        raise CaptureError("Refusing to keep an empty credential file")
 
 
 def extract_secret(args, destination, resource, namespace, key):
@@ -605,7 +703,7 @@ def extract_secret(args, destination, resource, namespace, key):
         raise CaptureError("Could not extract required credential material")
     if destination.stat().st_size == 0:
         destination.unlink(missing_ok=True)
-        raise CaptureError(f"Extracted {resource} key {key} was empty")
+        raise CaptureError("Extracted credential material was empty")
     os.chmod(destination, 0o600)
 
 
@@ -653,7 +751,7 @@ def extract_crypto(args, stage_dir, identity, public_key):
     ).decode().strip()
     match = re.search(r"(?:^|,)CN=([^,]+)", subject.removeprefix("subject="))
     if not match:
-        raise CaptureError(f"Could not find a single CN in router-ca certificate: {subject}")
+        raise CaptureError("Router CA certificate has no usable common name")
     create_private_file(crypto / "ingress-cn.txt", (match.group(1) + "\n").encode(), 0o644)
 
     create_private_file(crypto / "cluster-tool.key", identity.read_bytes(), 0o600)
@@ -667,7 +765,7 @@ def confirm_downtime(args, domains):
         "The next step will gracefully shut down the three source VMs, capture their "
         "six disks, and restart them. The source cluster will be unavailable during capture."
     )
-    print("Source VMs: " + ", ".join(domains))
+    print("Source VMs: master indexes 0, 1, and 2")
     if args.yes:
         return
     if not sys.stdin.isatty():
@@ -690,7 +788,11 @@ def shutdown_domains(args, domains, shutdown_requested):
             if "shut off" in state:
                 pending.remove(domain)
         if pending:
-            print("Waiting for VMs to shut down: " + ", ".join(sorted(pending)), flush=True)
+            print(
+                "Waiting for source VMs to stop: "
+                + ", ".join(vm_label(domain) for domain in sorted(pending)),
+                flush=True,
+            )
             time.sleep(2)
     if pending:
         raise CaptureError(
@@ -720,7 +822,7 @@ def wait_for_domain_states(args, domains, predicate, *, timeout, description):
                 state = domain_state(args, domain, timeout=min(10, remaining))
             except (CaptureError, subprocess.TimeoutExpired) as error:
                 state = ""
-                last_state[domain] = f"state query failed: {error}"
+                last_state[domain] = "unavailable"
             else:
                 last_state[domain] = state or "empty state"
             if state and predicate(state):
@@ -730,7 +832,7 @@ def wait_for_domain_states(args, domains, predicate, *, timeout, description):
         print(
             f"Waiting for source VMs to {description}: "
             + ", ".join(
-                f"{domain} ({last_state.get(domain, 'state not checked')})"
+                f"{vm_label(domain)} ({last_state.get(domain, 'state not checked')})"
                 for domain in sorted(pending)
             ),
             flush=True,
@@ -751,7 +853,7 @@ def restart_domains(args, shutdown_requested):
     )
     for domain, state in sorted(unresolved.items()):
         errors.append(
-            "A source VM did not reach the stopped state during recovery; "
+            f"{vm_label(domain)} did not stop during recovery; "
             "manual follow-up is required because it may power off after the script exits."
         )
 
@@ -761,7 +863,7 @@ def restart_domains(args, shutdown_requested):
         try:
             run(virsh_command(args.libvirt_uri, "start", domain))
             started.add(domain)
-            print(f"Started {domain}; waiting for it to reach running state.")
+            print(f"Started {vm_label(domain)}; waiting for it to reach running state.")
         except (CaptureError, subprocess.TimeoutExpired) as error:
             try:
                 state = domain_state(args, domain)
@@ -770,7 +872,7 @@ def restart_domains(args, shutdown_requested):
             if "running" in state or "blocked" in state:
                 started.add(domain)
             else:
-                errors.append(f"{domain}: could not start: {error} (state: {state})")
+                errors.append(f"{vm_label(domain)} could not be started")
 
     unresolved = wait_for_domain_states(
         args,
@@ -781,8 +883,7 @@ def restart_domains(args, shutdown_requested):
     )
     for domain, state in sorted(unresolved.items()):
         errors.append(
-            f"{domain}: did not reach running state during recovery "
-            f"(last state: {state})"
+            f"{vm_label(domain)} did not return to running state during recovery"
         )
     return errors
 
@@ -792,8 +893,9 @@ def capture_disks(args, plan, stage_dir):
     for index, target, filename, _kind in DISK_LAYOUT:
         source = plan[(index, target)]["path"]
         destination = stage_dir / filename
+        disk_number = index * 2 + (1 if target == "vdb" else 0) + 1
         print(
-            f"Capturing {filename} "
+            f"Capturing disk {disk_number}/6 "
             f"({plan[(index, target)]['info'].get('virtual-size', 0) // 1024**3} GiB)...",
             flush=True,
         )
@@ -809,18 +911,17 @@ def capture_disks(args, plan, stage_dir):
         output_info = image_info(destination)
         expected_size = plan[(index, target)]["info"]["virtual-size"]
         if output_info.get("virtual-size") != expected_size:
-            raise CaptureError(f"Captured {filename} has an unexpected virtual size")
+            raise CaptureError(f"Captured disk {disk_number} has an unexpected virtual size")
         if output_info.get("backing-filename"):
-            raise CaptureError(f"Captured {filename} still has a backing file")
+            raise CaptureError(f"Captured disk {disk_number} still has a backing file")
         try:
             shutil.chown(destination, user="qemu", group="qemu")
         except (LookupError, PermissionError):
             raise CaptureError(
-                "Could not set captured disks to qemu:qemu ownership; "
-                "check that libvirt's qemu account exists"
+                "Could not set captured disks to the libvirt service account"
             )
         os.chmod(destination, 0o640)
-        print(f"  verified {filename}", flush=True)
+        print(f"  verified disk {disk_number}/6", flush=True)
 
 
 def ensure_free_space(destination_dir, plan):
@@ -907,12 +1008,12 @@ def restore_invoking_user_ownership(path):
         os.chown(path, int(sudo_uid), int(sudo_gid))
     except (OSError, ValueError) as error:
         raise CaptureError(
-            f"Could not restore invoking-user ownership on {path}: {error}"
+            "Could not restore invoking-user ownership on a cluster-tool state file"
         ) from error
 
 
-def register_flavor(state_dir, lock_dir, stage_dir, flavor_name, metadata):
-    """Lock, save, and atomically register the captured flavor."""
+def acquire_state_lock(state_dir, lock_dir):
+    """Create and acquire cluster-tool's shared state lock."""
     state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     restore_invoking_user_ownership(state_dir)
     lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -920,13 +1021,37 @@ def register_flavor(state_dir, lock_dir, stage_dir, flavor_name, metadata):
     restore_invoking_user_ownership(lock_dir)
     lock_path = lock_dir / "state.lock"
     descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-    final_dir = stage_dir.parent / flavor_name
-    moved = False
-    saved = False
     try:
         os.fchmod(descriptor, 0o600)
         restore_invoking_user_ownership(lock_path)
         fcntl.flock(descriptor, fcntl.LOCK_EX)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def ensure_flavor_name_available(state_dir, lock_dir, flavor_name, final_dir):
+    """Reject state or directory name conflicts before stopping source VMs."""
+    descriptor = acquire_state_lock(state_dir, lock_dir)
+    try:
+        state_path = state_dir / "state.json"
+        state = json.loads(state_path.read_text()) if state_path.exists() else {}
+        if flavor_name in state.get("flavors", {}) or final_dir.exists():
+            raise CaptureError(
+                "Flavor name is already registered; choose another name or remove it first"
+            )
+    finally:
+        os.close(descriptor)
+
+
+def register_flavor(state_dir, lock_dir, stage_dir, flavor_name, metadata):
+    """Lock, save, and atomically register the captured flavor."""
+    descriptor = acquire_state_lock(state_dir, lock_dir)
+    final_dir = stage_dir.parent / flavor_name
+    moved = False
+    saved = False
+    try:
         state_path = state_dir / "state.json"
         if state_path.exists():
             state = json.loads(state_path.read_text())
@@ -936,7 +1061,7 @@ def register_flavor(state_dir, lock_dir, stage_dir, flavor_name, metadata):
         state.setdefault("clones", {})
         if flavor_name in state["flavors"] or final_dir.exists():
             raise CaptureError(
-                f"Flavor '{flavor_name}' already exists; choose another name or delete it first"
+                "Flavor name is already registered; choose another name or remove it first"
             )
         state["flavors"][flavor_name] = metadata
         os.replace(stage_dir, final_dir)
@@ -967,7 +1092,7 @@ def main():
 
     kubeconfig = Path(args.kubeconfig).expanduser()
     if not kubeconfig.is_file():
-        raise CaptureError(f"Kubeconfig does not exist: {kubeconfig}")
+        raise CaptureError("Kubeconfig file is missing")
     args.kubeconfig = str(kubeconfig)
     identity = Path(args.ssh_identity).expanduser()
     public_key = Path(args.ssh_public_key).expanduser() if args.ssh_public_key else Path(str(identity) + ".pub")
@@ -976,12 +1101,12 @@ def main():
     flavors_dir = data_dir / "flavors"
     flavors_dir.mkdir(parents=True, exist_ok=True)
     final_dir = flavors_dir / args.flavor
-    if final_dir.exists():
-        raise CaptureError(f"Flavor directory already exists: {final_dir}")
+    ensure_flavor_name_available(state_dir, lock_dir, args.flavor, final_dir)
 
     etcd_image, node_ips = verify_cluster(args)
     preflight_ssh(args, public_key, node_ips)
     domains, plan = collect_source_plan(args)
+    verify_domain_node_bindings(args, domains, node_ips, identity)
     ensure_free_space(flavors_dir, plan)
 
     stage_dir = Path(
@@ -1008,7 +1133,7 @@ def main():
                     + "\n  ".join(restart_errors)
                 )
                 if original_error is not None:
-                    message += f"\nOriginal capture failure: {original_error}"
+                    message += "\nThe capture operation also failed."
                     raise CaptureError(message) from original_error
                 raise CaptureError(message)
 
@@ -1028,15 +1153,15 @@ def main():
         }
         registered = register_flavor(state_dir, lock_dir, stage_dir, args.flavor, metadata)
         stage_dir = None
-        print(f"\nFlavor '{args.flavor}' created and registered at {registered}")
-        print("Next: inspect it with './cluster-tool flavors --server local', then push it.")
+        print("\nFlavor capture and registration completed successfully.")
+        print("Inspect the local flavor, then push it with cluster-tool.")
     finally:
         if stage_dir and stage_dir.exists():
             if restarted or not shutdown_started:
                 shutil.rmtree(stage_dir)
             else:
                 print(
-                    f"Preserving capture staging directory for recovery: {stage_dir}",
+                    "Preserving the private capture staging directory for recovery.",
                     file=sys.stderr,
                 )
 
@@ -1051,8 +1176,15 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("Capture interrupted; source VM restart was attempted.", file=sys.stderr)
+        print("Capture interrupted; check source VM state before continuing.", file=sys.stderr)
         sys.exit(130)
-    except (CaptureError, subprocess.TimeoutExpired, OSError, json.JSONDecodeError) as error:
+    except CaptureError as error:
         print(f"ERROR: {error}", file=sys.stderr)
+        sys.exit(1)
+    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+        print(
+            "ERROR: A local command or state operation failed; "
+            "check the source VM state before continuing.",
+            file=sys.stderr,
+        )
         sys.exit(1)

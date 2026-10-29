@@ -47,15 +47,17 @@ uses different VM or disk sizes, pass the corresponding --expected-* options.
 
 Have the following information ready:
 
-- The VM name prefix. For example, the VMs
-  test-infra-cluster-edge16-master-0-0 through -0-2 use
-  test-infra-cluster-edge16.
+- The VM name prefix. For example, if your domains are
+  cluster-master-0-0 through cluster-master-0-2, use cluster.
 - The source primary subnet's third octet (for example, 123 for
   192.168.123.0/24). The script checks that the API address and all three
   node InternalIPs are inside 192.168.<octet>.0/24 before capture.
 - A kubeconfig with cluster-admin access, the reachable API IP, and a DNS name
   present in the API serving certificate. The script uses the IP for the
   connection and the DNS name for TLS verification.
+- Each libvirt domain must expose its guest interface MAC in domain XML, and
+  SSH to each API node must be able to run `ip -j -4 address show`. The script
+  matches each node's InternalIP interface MAC to its VM before shutdown.
 - An SSH identity whose public key is already authorized for core on all three
   masters. The script checks SSH access to each node. The key must be usable
   non-interactively and have mode 0600. Its matching .pub file must be next
@@ -79,22 +81,21 @@ timeout.
 
 ## Capture the flavor
 
-Example based on the edge16-24g cluster created in this session. Replace the
-cluster name, VM prefix, IPs, subnet, and paths with those for your source
-cluster.
+Replace the example cluster name, VM prefix, IPs, subnet, and paths with those
+for your source cluster.
 
-    cd /root/osac/cluster-tool
+    cd /path/to/cluster-tool
 
     ./scripts/capture_compact_flavor.py \
       --flavor mno-3node-24gb \
-      --source-cluster edge16-24g \
-      --vm-prefix test-infra-cluster-edge16 \
+      --source-cluster assisted-cluster \
+      --vm-prefix assisted-cluster \
       --source-primary-subnet 123 \
-      --api-address 192.168.123.64 \
-      --api-server-name api.edge16-24g.redhat.com \
-      --ssh-node-ip 192.168.123.64 \
-      --kubeconfig /root/kubeconfig \
-      --ssh-identity /home/kni/.ssh/id_rsa
+      --api-address 192.168.123.10 \
+      --api-server-name api.assisted.example.com \
+      --ssh-node-ip 192.168.123.10 \
+      --kubeconfig /path/to/admin.kubeconfig \
+      --ssh-identity /path/to/core-ssh-key
 
 The script prompts you to type shutdown before it stops the VMs. For an
 intentional non-interactive run, add --yes to acknowledge that downtime.
@@ -107,10 +108,10 @@ For example:
       --source-cluster assisted-cluster \
       --vm-prefix test-infra-cluster-assisted \
       --source-primary-subnet 123 \
-      --api-address 192.168.123.64 \
+      --api-address 192.168.123.10 \
       --api-server-name api.assisted.example.com \
-      --kubeconfig /root/kubeconfig \
-      --ssh-identity /home/kni/.ssh/id_rsa \
+      --kubeconfig /path/to/admin.kubeconfig \
+      --ssh-identity /path/to/core-ssh-key \
       --expected-memory-gib 32 \
       --expected-vcpus 16 \
       --expected-os-disk-gib 120 \
@@ -119,7 +120,16 @@ For example:
 On success, the flavor is registered in the same state.json used by
 cluster-tool, and the six files are stored below
 $CLUSTER_TOOL_DATA/flavors/<flavor>/. The script shares the cluster-tool state
-lock and writes the updated state atomically.
+lock and writes the updated state atomically. The crypto directory remains
+root-only (mode 0700), so run compact-boot with root permissions while
+preserving the home directory used to configure cluster-tool. For example, from
+the account that owns that configuration:
+
+    sudo env HOME="$HOME" /path/to/cluster-tool compact-boot \
+      --flavor mno-3node-24gb --name clone-name --subnet 216 --host local
+
+Do not loosen the crypto directory or key permissions. If you captured and
+configured cluster-tool as root, use the normal root command instead.
 
 Inspect the result before uploading:
 
