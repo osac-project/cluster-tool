@@ -35,6 +35,10 @@ class CaptureError(Exception):
     pass
 
 
+class StateCommittedError(CaptureError):
+    """State was replaced, but syncing its directory entry failed."""
+
+
 def display_command(command):
     """Return a command label without exposing arguments that may contain secrets."""
     executable = Path(str(command[0])).name
@@ -793,10 +797,14 @@ def capture_disks(args, plan, stage_dir):
             f"({plan[(index, target)]['info'].get('virtual-size', 0) // 1024**3} GiB)...",
             flush=True,
         )
-        run_visible(
-            ["qemu-img", "convert", "-p", "-O", "qcow2", source, destination],
-            timeout=3600,
-        )
+        previous_umask = os.umask(0o077)
+        try:
+            run_visible(
+                ["qemu-img", "convert", "-p", "-O", "qcow2", source, destination],
+                timeout=3600,
+            )
+        finally:
+            os.umask(previous_umask)
         run(["qemu-img", "check", "-f", "qcow2", destination])
         output_info = image_info(destination)
         expected_size = plan[(index, target)]["info"]["virtual-size"]
@@ -815,11 +823,11 @@ def capture_disks(args, plan, stage_dir):
         print(f"  verified {filename}", flush=True)
 
 
-def ensure_free_space(data_dir, plan):
-    """Require capacity for materializing all source disks plus a safety margin."""
+def ensure_free_space(destination_dir, plan):
+    """Require capacity on the flavor destination filesystem plus a safety margin."""
     total = sum(int(item["info"]["virtual-size"]) for item in plan.values())
     required = int(total * 1.15) + 1024**3
-    usage = shutil.disk_usage(data_dir)
+    usage = shutil.disk_usage(destination_dir)
     if usage.free < required:
         raise CaptureError(
             f"Not enough free space for capture: need about "
@@ -840,6 +848,8 @@ def save_state_atomic(config_dir, state):
         existing_stat = None
     mode = stat.S_IMODE(existing_stat.st_mode) if existing_stat else 0o600
     fd, temp_name = tempfile.mkstemp(prefix=".state-", dir=config_dir)
+    directory_fd = None
+    committed = False
     try:
         with os.fdopen(fd, "w") as output:
             sudo_uid = os.environ.get("SUDO_UID")
@@ -856,16 +866,33 @@ def save_state_atomic(config_dir, state):
             output.write("\n")
             output.flush()
             os.fsync(output.fileno())
-        os.replace(temp_name, target)
-        restore_invoking_user_ownership(target)
+        # Open the directory before replacing state.json so a failure here cannot
+        # occur after the state commit and trigger a rollback of the flavor.
         directory_fd = os.open(config_dir, os.O_DIRECTORY)
+        os.replace(temp_name, target)
+        committed = True
         try:
             os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        except OSError as error:
+            raise StateCommittedError(
+                "state.json was replaced, but syncing its directory failed; "
+                "the flavor remains registered"
+            ) from error
     except Exception:
-        Path(temp_name).unlink(missing_ok=True)
+        if not committed:
+            Path(temp_name).unlink(missing_ok=True)
         raise
+    finally:
+        if directory_fd is not None:
+            try:
+                os.close(directory_fd)
+            except OSError as error:
+                if committed:
+                    raise StateCommittedError(
+                        "state.json was replaced, but closing its directory failed; "
+                        "the flavor remains registered"
+                    ) from error
+                raise
 
 
 def restore_invoking_user_ownership(path):
@@ -914,8 +941,13 @@ def register_flavor(state_dir, lock_dir, stage_dir, flavor_name, metadata):
         state["flavors"][flavor_name] = metadata
         os.replace(stage_dir, final_dir)
         moved = True
-        save_state_atomic(state_dir, state)
-        saved = True
+        try:
+            save_state_atomic(state_dir, state)
+            saved = True
+        except StateCommittedError:
+            # The state points at final_dir; never roll it back after replacement.
+            saved = True
+            raise
     except Exception:
         if moved and not saved and final_dir.exists():
             os.replace(final_dir, stage_dir)
@@ -950,12 +982,12 @@ def main():
     etcd_image, node_ips = verify_cluster(args)
     preflight_ssh(args, public_key, node_ips)
     domains, plan = collect_source_plan(args)
-    ensure_free_space(data_dir, plan)
+    ensure_free_space(flavors_dir, plan)
 
     stage_dir = Path(
         tempfile.mkdtemp(prefix=f".{args.flavor}.capture-", dir=flavors_dir)
     )
-    os.chmod(stage_dir, 0o755)
+    os.chmod(stage_dir, 0o700)
     shutdown_started = False
     restarted = False
     shutdown_requested = set()
@@ -980,6 +1012,9 @@ def main():
                     raise CaptureError(message) from original_error
                 raise CaptureError(message)
 
+        # Expose the directory only after capture is complete. The private
+        # crypto subdirectory remains mode 0700.
+        os.chmod(stage_dir, 0o755)
         disk_names = [entry[2] for entry in DISK_LAYOUT]
         metadata = {
             "topology": "compact",
