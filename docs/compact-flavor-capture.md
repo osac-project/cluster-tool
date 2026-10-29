@@ -60,10 +60,11 @@ Have the following information ready:
   masters. The script checks SSH access to each node. The key must be usable
   non-interactively and have mode 0600. Its matching .pub file must be next
   to it unless --ssh-public-key is provided.
-- Enough free space under the configured CLUSTER_TOOL_DATA directory. The
-  preflight sums the disks' virtual sizes as a conservative estimate of
-  materialized output, then requires a 15% margin plus 1 GiB. Sparse qcow2
-  output may use less, but the check will not assume that it can.
+- Enough free space on the filesystem that contains the configured
+  CLUSTER_TOOL_DATA/flavors directory. The preflight checks the flavor
+  destination filesystem, sums the disks' virtual sizes as a conservative
+  estimate of materialized output, then requires a 15% margin plus 1 GiB.
+  Sparse qcow2 output may use less, but the check will not assume that it can.
 
 The source VMs must be running when you start. The capture gracefully shuts
 down all three VMs while copying disks, so the source cluster will be
@@ -132,9 +133,10 @@ Check the actual flavor path if CLUSTER_TOOL_DATA is not
 
 ## Push to Quay
 
-Log in as the same account that will push the image, then push the registered
-flavor. cluster-tool push does not capture disks; it only packages and uploads
-an existing local flavor.
+The capture keeps private credentials root-only. Run the upload as root too;
+if you use sudo, use it for both login and push so the root account can read
+the captured flavor and its Podman credentials. cluster-tool push does not
+capture disks; it only packages and uploads an existing local flavor.
 
     podman login quay.io
 
