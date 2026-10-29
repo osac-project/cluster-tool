@@ -65,10 +65,11 @@ Have the following information ready:
   non-interactively and have mode 0600. Its matching .pub file must be next
   to it unless --ssh-public-key is provided.
 - Enough free space on the filesystem that contains the configured
-  CLUSTER_TOOL_DATA/flavors directory. The preflight checks the flavor
-  destination filesystem, sums the disks' virtual sizes as a conservative
-  estimate of materialized output, then requires a 15% margin plus 1 GiB.
-  Sparse qcow2 output may use less, but the check will not assume that it can.
+  CLUSTER_TOOL_DATA/flavors directory. The preflight sums each source disk's
+  qemu-img `actual-size` when available, falling back to its virtual size if
+  the allocated size is missing or invalid. It requires a 15% margin plus
+  1 GiB. The captured qcow2 files can be smaller when the source contains
+  sparse or zero-filled regions.
 
 The source VMs must be running when you start. The capture gracefully shuts
 down all three VMs while copying disks, so the source cluster will be
