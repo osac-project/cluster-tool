@@ -27,11 +27,418 @@ ct.KUBECONFIG_DIR = ct._REAL_HOME / ".kube"
 ct.CLIENT_CONFIG_DIR = ct._REAL_HOME / ".config" / "cluster-tool"
 ct.CLIENT_SERVERS_FILE = ct.CLIENT_CONFIG_DIR / "servers.json"
 
+capture_loader = importlib.machinery.SourceFileLoader(
+    "capture_compact_flavor", "./scripts/capture_compact_flavor.py"
+)
+capture_spec = importlib.util.spec_from_loader(
+    "capture_compact_flavor", capture_loader, origin="./scripts/capture_compact_flavor.py"
+)
+capture = importlib.util.module_from_spec(capture_spec)
+capture_spec.loader.exec_module(capture)
+
 
 def _fixture_pem(kind, body):
     marker = "-----" + "BEGIN " + kind + "-----"
     end = "-----" + "END " + kind + "-----"
     return f"{marker}\n{body}\n{end}".encode()
+
+
+class TestCompactFlavorCapture(unittest.TestCase):
+    def capture_args(self, ssh_node_ip=None):
+        return argparse.Namespace(
+            flavor="test-flavor",
+            source_cluster="source-cluster",
+            vm_prefix="",
+            source_primary_subnet=123,
+            api_address="192.168.123.5",
+            api_server_name="api.source.example.test",
+            ssh_node_ip=ssh_node_ip,
+            kubeconfig="/tmp/kubeconfig",
+            shutdown_timeout=300,
+            expected_memory_gib=24,
+            expected_vcpus=12,
+            expected_os_disk_gib=80,
+            expected_spare_disk_gib=132,
+        )
+
+    def test_ssh_preflight_defaults_to_verified_master_ip(self):
+        args = self.capture_args()
+        capture.validate_args(args)
+        node_ips = {
+            "master-0-0": "192.168.123.64",
+            "master-0-1": "192.168.123.65",
+            "master-0-2": "192.168.123.50",
+        }
+
+        self.assertFalse(args.ssh_node_ip_explicit)
+        self.assertIsNone(args.ssh_node_ip)
+        self.assertEqual(
+            capture.ssh_preflight_address(args, "master-0-0", node_ips),
+            node_ips["master-0-0"],
+        )
+
+    def test_ssh_preflight_honors_only_an_explicit_master_override(self):
+        args = self.capture_args("192.168.123.66")
+        capture.validate_args(args)
+        node_ips = {
+            "master-0-0": "192.168.123.64",
+            "master-0-1": "192.168.123.65",
+            "master-0-2": "192.168.123.50",
+        }
+
+        self.assertTrue(args.ssh_node_ip_explicit)
+        self.assertEqual(
+            capture.ssh_preflight_address(args, "master-0-0", node_ips),
+            "192.168.123.66",
+        )
+        self.assertEqual(
+            capture.ssh_preflight_address(args, "master-0-1", node_ips),
+            node_ips["master-0-1"],
+        )
+
+    def test_read_booted_ostree_deployment_uses_verified_master_ip(self):
+        args = self.capture_args()
+        capture.validate_args(args)
+        node_ips = {
+            "master-0-0": "192.168.123.64",
+            "master-0-1": "192.168.123.65",
+            "master-0-2": "192.168.123.50",
+        }
+        status = b"* rhcos abcdef0123456789.0\n  rhcos 0123456789abcdef.0\n"
+
+        with patch.object(capture, "run", return_value=status) as run_command:
+            deployment = capture.read_booted_ostree_deployment(
+                args, node_ips, Path("/tmp/core-key")
+            )
+
+        self.assertEqual(deployment, "abcdef0123456789.0")
+        command = run_command.call_args.args[0]
+        self.assertIn("core@192.168.123.64", command)
+        self.assertEqual(command[-5:], ["sudo", "-n", "ostree", "admin", "status"])
+        self.assertEqual(run_command.call_args.kwargs["timeout"], 20)
+
+    def test_read_booted_ostree_deployment_rejects_ambiguous_status(self):
+        args = self.capture_args()
+        capture.validate_args(args)
+        node_ips = {
+            name: f"192.168.123.{64 + index}"
+            for index, name in enumerate(capture.NODE_NAMES)
+        }
+        status = b"* rhcos first.0\n* rhcos second.0\n"
+
+        with patch.object(capture, "run", return_value=status):
+            with self.assertRaisesRegex(capture.CaptureError, "exactly one booted"):
+                capture.read_booted_ostree_deployment(
+                    args, node_ips, Path("/tmp/core-key")
+                )
+
+    def test_build_flavor_metadata_records_booted_deployment(self):
+        metadata = capture.build_flavor_metadata(
+            self.capture_args(), "quay.io/example/etcd@sha256:abc", "deployment.0"
+        )
+
+        self.assertEqual(metadata["rhcos_deployment"], "deployment.0")
+        self.assertEqual(metadata["etcd_image"], "quay.io/example/etcd@sha256:abc")
+        self.assertEqual(
+            metadata["disks"], [entry[2] for entry in capture.DISK_LAYOUT]
+        )
+
+    def test_reflink_capture_repairs_leaks_before_normal_image_check(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stage_dir = Path(temp_dir)
+            plan = {}
+            sizes = {}
+            for index, target, filename, _kind in capture.DISK_LAYOUT:
+                virtual_size = (80 if target == "vda" else 132) * 1024**3
+                plan[(index, target)] = {
+                    "path": Path(f"/source/{filename}"),
+                    "capture_method": "reflink",
+                    "info": {
+                        "format": "qcow2",
+                        "virtual-size": virtual_size,
+                        "snapshots": [],
+                    },
+                }
+                sizes[filename] = virtual_size
+
+            check_calls = []
+
+            def reflink_copy(command, **_kwargs):
+                Path(command[-1]).write_bytes(b"qcow2 data")
+                return MagicMock(returncode=0)
+
+            def record_check(command, **kwargs):
+                check_calls.append((command, kwargs))
+                return b""
+
+            with patch.object(capture.subprocess, "run", side_effect=reflink_copy), \
+                 patch.object(capture, "run", side_effect=record_check), \
+                 patch.object(capture, "run_visible") as run_visible, \
+                 patch.object(capture, "ensure_conversion_space") as conversion_space, \
+                 patch.object(
+                     capture,
+                     "image_info",
+                     side_effect=lambda path: {
+                         "virtual-size": sizes[Path(path).name],
+                         "actual-size": 1024,
+                     },
+                 ), \
+                 patch.object(capture.shutil, "chown"):
+                capture.capture_disks(argparse.Namespace(), plan, stage_dir)
+
+            self.assertEqual(len(check_calls), 12)
+            self.assertFalse(run_visible.called)
+            self.assertFalse(conversion_space.called)
+            for repair, verify in zip(check_calls[::2], check_calls[1::2]):
+                repair_command, repair_kwargs = repair
+                verify_command, _verify_kwargs = verify
+                self.assertEqual(
+                    [str(part) for part in repair_command[1:5]],
+                    ["check", "-r", "leaks", "-f"],
+                )
+                self.assertEqual(repair_command[-1], verify_command[-1])
+                self.assertEqual(repair_kwargs["timeout"], 600)
+                self.assertEqual(
+                    [str(part) for part in verify_command[1:4]],
+                    ["check", "-f", "qcow2"],
+                )
+
+    def test_qcow2_with_internal_snapshots_uses_convert(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stage_dir = Path(temp_dir)
+            plan = {}
+            sizes = {}
+            copy_destinations = []
+            for index, target, filename, _kind in capture.DISK_LAYOUT:
+                virtual_size = (80 if target == "vda" else 132) * 1024**3
+                info = {"format": "qcow2", "virtual-size": virtual_size}
+                if (index, target) == (0, "vda"):
+                    info["snapshots"] = [{"id": "old-state"}]
+                else:
+                    info["snapshots"] = []
+                plan[(index, target)] = {
+                    "path": Path(f"/source/{filename}"),
+                    "capture_method": (
+                        "convert" if (index, target) == (0, "vda") else "reflink"
+                    ),
+                    "info": info,
+                }
+                sizes[filename] = virtual_size
+
+            def reflink_copy(command, **_kwargs):
+                copy_destinations.append(command[-1])
+                Path(command[-1]).write_bytes(b"reflink qcow2")
+                return MagicMock(returncode=0)
+
+            def convert(command, **_kwargs):
+                Path(command[-1]).write_bytes(b"converted active layer")
+                return 0.1
+
+            with patch.object(capture.subprocess, "run", side_effect=reflink_copy), \
+                 patch.object(capture, "run", return_value=b""), \
+                 patch.object(capture, "run_visible", side_effect=convert) as run_visible, \
+                 patch.object(capture, "ensure_conversion_space") as conversion_space, \
+                 patch.object(
+                     capture,
+                     "image_info",
+                     side_effect=lambda path: {
+                         "virtual-size": sizes[Path(path).name],
+                         "actual-size": 1024,
+                     },
+                 ), \
+                 patch.object(capture.shutil, "chown"):
+                capture.capture_disks(argparse.Namespace(), plan, stage_dir)
+
+            snapshot_disk = str(stage_dir / "disk-0.qcow2")
+            self.assertNotIn(snapshot_disk, copy_destinations)
+            self.assertEqual(len(copy_destinations), 5)
+            self.assertEqual(run_visible.call_count, 1)
+            self.assertIn(
+                Path("/source/disk-0.qcow2"), run_visible.call_args.args[0]
+            )
+            conversion_space.assert_called_once_with(
+                stage_dir, plan[(0, "vda")], 1
+            )
+
+    def test_preflight_selects_capture_methods_before_downtime(self):
+        plan = {}
+        for index, target, filename, _kind in capture.DISK_LAYOUT:
+            info = {
+                "format": "qcow2",
+                "virtual-size": (80 if target == "vda" else 132) * 1024**3,
+                "snapshots": [],
+            }
+            if (index, target) == (0, "vda"):
+                info["snapshots"] = [{"id": "old-state"}]
+            if (index, target) == (0, "vdb"):
+                info["format"] = "raw"
+            plan[(index, target)] = {
+                "path": Path(f"/source/{filename}"),
+                "capture_method": (
+                    "convert" if (index, target) == (0, "vda") else "reflink"
+                ),
+                "info": info,
+            }
+
+        with patch.object(
+            capture,
+            "probe_reflink",
+            side_effect=lambda source, _destination: "disk-1.qcow2" not in str(source),
+        ) as probe:
+            capture.prepare_capture_methods(Path("/capture"), plan)
+
+        self.assertEqual(probe.call_count, 4)
+        self.assertEqual(plan[(0, "vda")]["capture_method"], "convert")
+        self.assertEqual(plan[(0, "vdb")]["capture_method"], "convert")
+        self.assertEqual(plan[(1, "vda")]["capture_method"], "convert")
+        self.assertEqual(plan[(2, "vda")]["capture_method"], "reflink")
+        self.assertEqual(plan[(2, "vdb")]["capture_method"], "reflink")
+
+    def test_space_preflight_reserves_virtual_capacity_for_conversions(self):
+        convert_size = 80 * 1024**3
+        reflink_size = 132 * 1024**3
+        required = (
+            int(convert_size * 1.15) + 1024**3
+            + int(10 * 1024**3 * 1.15) + 1024**3
+        )
+        plan = {
+            (0, "vda"): {
+                "capture_method": "convert",
+                "info": {
+                    "virtual-size": convert_size,
+                    "actual-size": 1024**3,
+                },
+            },
+            (0, "vdb"): {
+                "capture_method": "reflink",
+                "info": {
+                    "virtual-size": reflink_size,
+                    "actual-size": 10 * 1024**3,
+                },
+            },
+        }
+
+        with patch.object(
+            capture.shutil,
+            "disk_usage",
+            return_value=MagicMock(free=required - 1),
+        ):
+            with self.assertRaisesRegex(capture.CaptureError, "Not enough free space"):
+                capture.ensure_free_space(Path("/capture"), plan)
+
+    def test_preflight_reflink_failure_does_not_start_unreserved_conversion(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stage_dir = Path(temp_dir)
+            source = Path("/source/disk-0.qcow2")
+            item = {
+                "path": source,
+                "capture_method": "reflink",
+                "info": {
+                    "format": "qcow2",
+                    "virtual-size": 80 * 1024**3,
+                    "snapshots": [],
+                },
+            }
+            plan = {(0, "vda"): item}
+
+            with patch.object(
+                capture.subprocess,
+                "run",
+                return_value=MagicMock(returncode=1),
+            ), patch.object(capture, "run_visible") as convert:
+                with self.assertRaisesRegex(capture.CaptureError, "refusing an unreserved conversion"):
+                    capture.capture_disks(argparse.Namespace(), plan, stage_dir)
+
+            convert.assert_not_called()
+
+    def test_conversion_space_uses_per_disk_virtual_size_bound(self):
+        virtual_size = 80 * 1024**3
+        required = int(virtual_size * 1.15) + 1024**3
+        with patch.object(
+            capture.shutil,
+            "disk_usage",
+            return_value=MagicMock(free=required - 3 * 1024**3),
+        ):
+            with self.assertRaisesRegex(
+                capture.CaptureError,
+                r"disk 4: need about 93\.0 GiB, have 90\.0 GiB",
+            ):
+                capture.ensure_conversion_space(
+                    Path("/capture"), {"info": {"virtual-size": virtual_size}}, 4
+                )
+
+        with patch.object(
+            capture.shutil, "disk_usage", return_value=MagicMock(free=required)
+        ):
+            capture.ensure_conversion_space(
+                Path("/capture"), {"info": {"virtual-size": virtual_size}}, 4
+            )
+
+    def test_conversion_checks_space_before_each_qemu_convert(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stage_dir = Path(temp_dir)
+            plan = {}
+            sizes = {}
+            events = []
+            for index, target, filename, _kind in capture.DISK_LAYOUT:
+                virtual_size = (80 if target == "vda" else 132) * 1024**3
+                plan[(index, target)] = {
+                    "path": Path(f"/source/{filename}"),
+                    "capture_method": "convert",
+                    "info": {"format": "raw", "virtual-size": virtual_size},
+                }
+                sizes[filename] = virtual_size
+
+            def convert(command, **_kwargs):
+                events.append("convert")
+                Path(command[-1]).write_bytes(b"converted qcow2")
+                return 0.1
+
+            def check(command, **_kwargs):
+                return b""
+
+            with patch.object(
+                capture,
+                "ensure_conversion_space",
+                side_effect=lambda _directory, _item, _number: events.append("space"),
+            ) as conversion_space, \
+                 patch.object(capture, "run_visible", side_effect=convert), \
+                 patch.object(capture, "run", side_effect=check), \
+                 patch.object(
+                     capture,
+                     "image_info",
+                     side_effect=lambda path: {
+                         "virtual-size": sizes[Path(path).name],
+                         "actual-size": 1024,
+                     },
+                 ), \
+                 patch.object(capture.shutil, "chown"):
+                capture.capture_disks(argparse.Namespace(), plan, stage_dir)
+
+            self.assertEqual(conversion_space.call_count, 6)
+            self.assertEqual(events, ["space", "convert"] * 6)
+
+    def test_source_plan_rejects_external_qcow2_data_file_before_capture(self):
+        args = argparse.Namespace(
+            vm_prefix="source",
+            expected_memory_gib=24,
+            expected_vcpus=12,
+            expected_os_disk_gib=80,
+            expected_spare_disk_gib=132,
+            libvirt_uri=None,
+        )
+        dominfo = b"State: running\nCPU(s): 12\nMax memory: 25165824 KiB\n"
+        disks = {"vda": Path("/source/os.qcow2"), "vdb": Path("/source/spare.qcow2")}
+        external_data = {
+            "format": "qcow2",
+            "virtual-size": 80 * 1024**3,
+            "format-specific": {"type": "qcow2", "data": {"data-file": "/source/os.data"}},
+        }
+        with patch.object(capture, "run", return_value=dominfo), \
+             patch.object(capture, "resolve_domain_disks", return_value=disks), \
+             patch.object(capture, "image_info", return_value=external_data):
+            with self.assertRaisesRegex(capture.CaptureError, "external data file"):
+                capture.collect_source_plan(args)
 
 
 class MockStateEnv:
