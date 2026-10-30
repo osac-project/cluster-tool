@@ -44,6 +44,111 @@ def _fixture_pem(kind, body):
 
 
 class TestCompactFlavorCapture(unittest.TestCase):
+    def capture_args(self, ssh_node_ip=None):
+        return argparse.Namespace(
+            flavor="test-flavor",
+            source_cluster="source-cluster",
+            vm_prefix="",
+            source_primary_subnet=123,
+            api_address="192.168.123.5",
+            api_server_name="api.source.example.test",
+            ssh_node_ip=ssh_node_ip,
+            kubeconfig="/tmp/kubeconfig",
+            shutdown_timeout=300,
+            expected_memory_gib=24,
+            expected_vcpus=12,
+            expected_os_disk_gib=80,
+            expected_spare_disk_gib=132,
+        )
+
+    def test_ssh_preflight_defaults_to_verified_master_ip(self):
+        args = self.capture_args()
+        capture.validate_args(args)
+        node_ips = {
+            "master-0-0": "192.168.123.64",
+            "master-0-1": "192.168.123.65",
+            "master-0-2": "192.168.123.50",
+        }
+
+        self.assertFalse(args.ssh_node_ip_explicit)
+        self.assertIsNone(args.ssh_node_ip)
+        self.assertEqual(
+            capture.ssh_preflight_address(args, "master-0-0", node_ips),
+            node_ips["master-0-0"],
+        )
+
+    def test_ssh_preflight_honors_only_an_explicit_master_override(self):
+        args = self.capture_args("192.168.123.66")
+        capture.validate_args(args)
+        node_ips = {
+            "master-0-0": "192.168.123.64",
+            "master-0-1": "192.168.123.65",
+            "master-0-2": "192.168.123.50",
+        }
+
+        self.assertTrue(args.ssh_node_ip_explicit)
+        self.assertEqual(
+            capture.ssh_preflight_address(args, "master-0-0", node_ips),
+            "192.168.123.66",
+        )
+        self.assertEqual(
+            capture.ssh_preflight_address(args, "master-0-1", node_ips),
+            node_ips["master-0-1"],
+        )
+
+    def test_reflink_capture_repairs_leaks_before_normal_image_check(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stage_dir = Path(temp_dir)
+            plan = {}
+            sizes = {}
+            for index, target, filename, _kind in capture.DISK_LAYOUT:
+                virtual_size = (80 if target == "vda" else 132) * 1024**3
+                plan[(index, target)] = {
+                    "path": Path(f"/source/{filename}"),
+                    "info": {"format": "qcow2", "virtual-size": virtual_size},
+                }
+                sizes[filename] = virtual_size
+
+            check_calls = []
+
+            def reflink_copy(command, **_kwargs):
+                Path(command[-1]).write_bytes(b"qcow2 data")
+                return MagicMock(returncode=0)
+
+            def record_check(command, **kwargs):
+                check_calls.append((command, kwargs))
+                return b""
+
+            with patch.object(capture.subprocess, "run", side_effect=reflink_copy), \
+                 patch.object(capture, "run", side_effect=record_check), \
+                 patch.object(capture, "run_visible") as run_visible, \
+                 patch.object(
+                     capture,
+                     "image_info",
+                     side_effect=lambda path: {
+                         "virtual-size": sizes[Path(path).name],
+                         "actual-size": 1024,
+                     },
+                 ), \
+                 patch.object(capture.shutil, "chown"):
+                capture.capture_disks(argparse.Namespace(), plan, stage_dir)
+
+            self.assertEqual(len(check_calls), 12)
+            self.assertFalse(run_visible.called)
+            for repair, verify in zip(check_calls[::2], check_calls[1::2]):
+                repair_command, repair_kwargs = repair
+                verify_command, _verify_kwargs = verify
+                self.assertEqual(
+                    [str(part) for part in repair_command[1:5]],
+                    ["check", "-r", "leaks", "-f"],
+                )
+                self.assertEqual(repair_command[-1], verify_command[-1])
+                self.assertEqual(repair_kwargs["timeout"], 600)
+                self.assertEqual(
+                    [str(part) for part in verify_command[1:4]],
+                    ["check", "-f", "qcow2"],
+                )
+
     def test_source_plan_rejects_external_qcow2_data_file_before_capture(self):
         args = argparse.Namespace(
             vm_prefix="source",
