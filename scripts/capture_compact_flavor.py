@@ -790,6 +790,41 @@ def preflight_ssh(args, public_key, node_ips):
     print("SSH key access verified on all three masters.")
 
 
+def read_booted_ostree_deployment(args, node_ips, identity):
+    """Read the booted RHCOS deployment from master-0-0 before downtime."""
+    ssh_address = ssh_preflight_address(args, NODE_NAMES[0], node_ips)
+    status = run(
+        [
+            "ssh",
+            "-i",
+            str(identity),
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            f"core@{ssh_address}",
+            "sudo",
+            "-n",
+            "ostree",
+            "admin",
+            "status",
+        ],
+        timeout=20,
+    ).decode(errors="replace")
+    booted = [
+        line.split()
+        for line in status.splitlines()
+        if line.lstrip().startswith("*")
+    ]
+    if len(booted) != 1 or len(booted[0]) < 3:
+        raise CaptureError(
+            "Could not identify exactly one booted OSTree deployment from source status"
+        )
+    return booted[0][2]
+
+
 def create_private_file(path, data, mode=0o600):
     """Create a new file without overwriting it and set its mode."""
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
@@ -1048,6 +1083,7 @@ def capture_disks(args, plan, stage_dir):
                         flush=True,
                     )
             if method == "convert":
+                ensure_conversion_space(stage_dir, item, disk_number)
                 run_visible(
                     ["qemu-img", "convert", "-p", "-O", "qcow2", source, destination],
                     timeout=3600,
@@ -1128,6 +1164,34 @@ def ensure_free_space(destination_dir, plan):
             f"Used virtual-size fallback for {virtual_size_fallbacks} disk(s) "
             "without a valid actual-size value."
         )
+
+
+def ensure_conversion_space(destination_dir, item, disk_number):
+    """Require room for a conservative full-size conversion of one disk."""
+    virtual_size = int(item["info"]["virtual-size"])
+    required = int(virtual_size * 1.15) + 1024**3
+    available = shutil.disk_usage(destination_dir).free
+    if available < required:
+        raise CaptureError(
+            f"Not enough free space for conversion of disk {disk_number}: "
+            f"need about {required / 1024**3:.1f} GiB, "
+            f"have {available / 1024**3:.1f} GiB"
+        )
+
+
+def build_flavor_metadata(args, etcd_image, rhcos_deployment):
+    """Build the persisted metadata for a captured compact flavor."""
+    return {
+        "topology": "compact",
+        "source_cluster": args.source_cluster,
+        "source_primary_subnet": args.source_primary_subnet,
+        "memory_kib": args.expected_memory_gib * 1024 * 1024,
+        "vcpus": args.expected_vcpus,
+        "disks": [entry[2] for entry in DISK_LAYOUT],
+        "etcd_image": etcd_image,
+        "rhcos_deployment": rhcos_deployment,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def save_state_atomic(config_dir, state):
@@ -1296,6 +1360,7 @@ def main():
 
     etcd_image, node_ips = verify_cluster(args)
     preflight_ssh(args, public_key, node_ips)
+    rhcos_deployment = read_booted_ostree_deployment(args, node_ips, identity)
     domains, plan = collect_source_plan(args)
     verify_domain_node_bindings(args, domains, node_ips, identity)
     ensure_free_space(flavors_dir, plan)
@@ -1332,17 +1397,7 @@ def main():
         # Expose the directory only after capture is complete. The private
         # crypto subdirectory remains mode 0700.
         os.chmod(stage_dir, 0o755)
-        disk_names = [entry[2] for entry in DISK_LAYOUT]
-        metadata = {
-            "topology": "compact",
-            "source_cluster": args.source_cluster,
-            "source_primary_subnet": args.source_primary_subnet,
-            "memory_kib": args.expected_memory_gib * 1024 * 1024,
-            "vcpus": args.expected_vcpus,
-            "disks": disk_names,
-            "etcd_image": etcd_image,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
+        metadata = build_flavor_metadata(args, etcd_image, rhcos_deployment)
         registered = register_flavor(state_dir, lock_dir, stage_dir, args.flavor, metadata)
         stage_dir = None
         print("\nFlavor capture and registration completed successfully.")
