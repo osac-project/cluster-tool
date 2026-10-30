@@ -96,6 +96,53 @@ class TestCompactFlavorCapture(unittest.TestCase):
             node_ips["master-0-1"],
         )
 
+    def test_read_booted_ostree_deployment_uses_verified_master_ip(self):
+        args = self.capture_args()
+        capture.validate_args(args)
+        node_ips = {
+            "master-0-0": "192.168.123.64",
+            "master-0-1": "192.168.123.65",
+            "master-0-2": "192.168.123.50",
+        }
+        status = b"* rhcos abcdef0123456789.0\n  rhcos 0123456789abcdef.0\n"
+
+        with patch.object(capture, "run", return_value=status) as run_command:
+            deployment = capture.read_booted_ostree_deployment(
+                args, node_ips, Path("/tmp/core-key")
+            )
+
+        self.assertEqual(deployment, "abcdef0123456789.0")
+        command = run_command.call_args.args[0]
+        self.assertIn("core@192.168.123.64", command)
+        self.assertEqual(command[-5:], ["sudo", "-n", "ostree", "admin", "status"])
+        self.assertEqual(run_command.call_args.kwargs["timeout"], 20)
+
+    def test_read_booted_ostree_deployment_rejects_ambiguous_status(self):
+        args = self.capture_args()
+        capture.validate_args(args)
+        node_ips = {
+            name: f"192.168.123.{64 + index}"
+            for index, name in enumerate(capture.NODE_NAMES)
+        }
+        status = b"* rhcos first.0\n* rhcos second.0\n"
+
+        with patch.object(capture, "run", return_value=status):
+            with self.assertRaisesRegex(capture.CaptureError, "exactly one booted"):
+                capture.read_booted_ostree_deployment(
+                    args, node_ips, Path("/tmp/core-key")
+                )
+
+    def test_build_flavor_metadata_records_booted_deployment(self):
+        metadata = capture.build_flavor_metadata(
+            self.capture_args(), "quay.io/example/etcd@sha256:abc", "deployment.0"
+        )
+
+        self.assertEqual(metadata["rhcos_deployment"], "deployment.0")
+        self.assertEqual(metadata["etcd_image"], "quay.io/example/etcd@sha256:abc")
+        self.assertEqual(
+            metadata["disks"], [entry[2] for entry in capture.DISK_LAYOUT]
+        )
+
     def test_reflink_capture_repairs_leaks_before_normal_image_check(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             stage_dir = Path(temp_dir)
@@ -122,6 +169,7 @@ class TestCompactFlavorCapture(unittest.TestCase):
             with patch.object(capture.subprocess, "run", side_effect=reflink_copy), \
                  patch.object(capture, "run", side_effect=record_check), \
                  patch.object(capture, "run_visible") as run_visible, \
+                 patch.object(capture, "ensure_conversion_space") as conversion_space, \
                  patch.object(
                      capture,
                      "image_info",
@@ -135,6 +183,7 @@ class TestCompactFlavorCapture(unittest.TestCase):
 
             self.assertEqual(len(check_calls), 12)
             self.assertFalse(run_visible.called)
+            self.assertFalse(conversion_space.called)
             for repair, verify in zip(check_calls[::2], check_calls[1::2]):
                 repair_command, repair_kwargs = repair
                 verify_command, _verify_kwargs = verify
@@ -148,6 +197,72 @@ class TestCompactFlavorCapture(unittest.TestCase):
                     [str(part) for part in verify_command[1:4]],
                     ["check", "-f", "qcow2"],
                 )
+
+    def test_conversion_space_uses_per_disk_virtual_size_bound(self):
+        virtual_size = 80 * 1024**3
+        required = int(virtual_size * 1.15) + 1024**3
+        with patch.object(
+            capture.shutil,
+            "disk_usage",
+            return_value=MagicMock(free=required - 3 * 1024**3),
+        ):
+            with self.assertRaisesRegex(
+                capture.CaptureError,
+                r"disk 4: need about 93\.0 GiB, have 90\.0 GiB",
+            ):
+                capture.ensure_conversion_space(
+                    Path("/capture"), {"info": {"virtual-size": virtual_size}}, 4
+                )
+
+        with patch.object(
+            capture.shutil, "disk_usage", return_value=MagicMock(free=required)
+        ):
+            capture.ensure_conversion_space(
+                Path("/capture"), {"info": {"virtual-size": virtual_size}}, 4
+            )
+
+    def test_conversion_checks_space_before_each_qemu_convert(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stage_dir = Path(temp_dir)
+            plan = {}
+            sizes = {}
+            events = []
+            for index, target, filename, _kind in capture.DISK_LAYOUT:
+                virtual_size = (80 if target == "vda" else 132) * 1024**3
+                plan[(index, target)] = {
+                    "path": Path(f"/source/{filename}"),
+                    "info": {"format": "raw", "virtual-size": virtual_size},
+                }
+                sizes[filename] = virtual_size
+
+            def convert(command, **_kwargs):
+                events.append("convert")
+                Path(command[-1]).write_bytes(b"converted qcow2")
+                return 0.1
+
+            def check(command, **_kwargs):
+                return b""
+
+            with patch.object(
+                capture,
+                "ensure_conversion_space",
+                side_effect=lambda _directory, _item, _number: events.append("space"),
+            ) as conversion_space, \
+                 patch.object(capture, "run_visible", side_effect=convert), \
+                 patch.object(capture, "run", side_effect=check), \
+                 patch.object(
+                     capture,
+                     "image_info",
+                     side_effect=lambda path: {
+                         "virtual-size": sizes[Path(path).name],
+                         "actual-size": 1024,
+                     },
+                 ), \
+                 patch.object(capture.shutil, "chown"):
+                capture.capture_disks(argparse.Namespace(), plan, stage_dir)
+
+            self.assertEqual(conversion_space.call_count, 6)
+            self.assertEqual(events, ["space", "convert"] * 6)
 
     def test_source_plan_rejects_external_qcow2_data_file_before_capture(self):
         args = argparse.Namespace(
