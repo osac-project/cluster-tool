@@ -120,11 +120,12 @@ def run_visible(command, *, timeout=3600, progress_interval=30):
                     key.fileobj.close()
                     continue
                 progress_buffer = (progress_buffer + chunk)[-256:]
-                for match in re.finditer(
+                matches = re.findall(
                     rb"\(\s*(\d+(?:\.\d+)?)/100%\s*\)", progress_buffer
-                ):
-                    percent = int(float(match.group(1)))
-                    if percent != last_percent:
+                )
+                if matches:
+                    percent = int(float(matches[-1]))
+                    if percent > last_percent:
                         print(f"  qemu-img convert {percent}%", flush=True)
                         last_percent = percent
                         next_status = time.monotonic() + progress_interval
@@ -609,7 +610,9 @@ def node_interface_mac(args, identity, node_name, node_ip):
     mac = interface.get("address")
     if not mac:
         interface_name = interface.get("ifname")
-        if not interface_name:
+        if not isinstance(interface_name, str) or not re.fullmatch(
+            r"[A-Za-z0-9_.-]{1,15}", interface_name
+        ):
             raise CaptureError(
                 f"Could not verify network identity for {node_label(node_name)}"
             )
@@ -704,6 +707,12 @@ def collect_source_plan(args):
                 raise CaptureError(
                     f"Disk {target} for {vm_label(domain)} uses a backing file; "
                     "flatten or consolidate the disk before capture"
+                )
+            format_data = (info.get("format-specific") or {}).get("data") or {}
+            if format_data.get("data-file"):
+                raise CaptureError(
+                    f"Disk {target} for {vm_label(domain)} uses an external data file; "
+                    "consolidate the disk before capture"
                 )
             expected_bytes = expected_gib * 1024**3
             if info.get("virtual-size") != expected_bytes:

@@ -71,8 +71,7 @@ For standalone qcow2 inputs, capture first tries a filesystem reflink. If the so
 
 The source VMs must be running when you start. The capture gracefully shuts
 down all three VMs while copying disks, so the source cluster will be
-unavailable for several minutes. The script tracks every VM sent a shutdown request, waits for it to stop, restarts it, and confirms it returns to a running state, including when disk capture fails. If recovery times out, it reports that manual follow-up is required and preserves the staging directory; a VM still shutting down may power off after the script exits. The script never force-powers VMs off. It verifies libvirt reports the source VMs running before it finishes, but does not wait for OpenShift nodes or operators to become Ready. Credential extraction and each reflink attempt have a 60-second timeout; each disk conversion has a one-hour timeout. The VMs are restarted after a conversion timeout. The VMs are restarted after a conversion
-timeout.
+unavailable for several minutes. The script tracks every VM sent a shutdown request, waits for it to stop, restarts it, and confirms it returns to a running state, including when disk capture fails. If recovery times out, it reports that manual follow-up is required and preserves the staging directory; a VM still shutting down may power off after the script exits. The script never force-powers VMs off. It verifies libvirt reports the source VMs running before it finishes, but does not wait for OpenShift nodes or operators to become Ready. Credential extraction and each reflink attempt have a 60-second timeout; each disk conversion has a one-hour timeout. The VMs are restarted after a conversion timeout.
 
 ## Capture the flavor
 

@@ -27,11 +27,44 @@ ct.KUBECONFIG_DIR = ct._REAL_HOME / ".kube"
 ct.CLIENT_CONFIG_DIR = ct._REAL_HOME / ".config" / "cluster-tool"
 ct.CLIENT_SERVERS_FILE = ct.CLIENT_CONFIG_DIR / "servers.json"
 
+capture_loader = importlib.machinery.SourceFileLoader(
+    "capture_compact_flavor", "./scripts/capture_compact_flavor.py"
+)
+capture_spec = importlib.util.spec_from_loader(
+    "capture_compact_flavor", capture_loader, origin="./scripts/capture_compact_flavor.py"
+)
+capture = importlib.util.module_from_spec(capture_spec)
+capture_spec.loader.exec_module(capture)
+
 
 def _fixture_pem(kind, body):
     marker = "-----" + "BEGIN " + kind + "-----"
     end = "-----" + "END " + kind + "-----"
     return f"{marker}\n{body}\n{end}".encode()
+
+
+class TestCompactFlavorCapture(unittest.TestCase):
+    def test_source_plan_rejects_external_qcow2_data_file_before_capture(self):
+        args = argparse.Namespace(
+            vm_prefix="source",
+            expected_memory_gib=24,
+            expected_vcpus=12,
+            expected_os_disk_gib=80,
+            expected_spare_disk_gib=132,
+            libvirt_uri=None,
+        )
+        dominfo = b"State: running\nCPU(s): 12\nMax memory: 25165824 KiB\n"
+        disks = {"vda": Path("/source/os.qcow2"), "vdb": Path("/source/spare.qcow2")}
+        external_data = {
+            "format": "qcow2",
+            "virtual-size": 80 * 1024**3,
+            "format-specific": {"type": "qcow2", "data": {"data-file": "/source/os.data"}},
+        }
+        with patch.object(capture, "run", return_value=dominfo), \
+             patch.object(capture, "resolve_domain_disks", return_value=disks), \
+             patch.object(capture, "image_info", return_value=external_data):
+            with self.assertRaisesRegex(capture.CaptureError, "external data file"):
+                capture.collect_source_plan(args)
 
 
 class MockStateEnv:
