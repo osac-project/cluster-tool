@@ -205,7 +205,10 @@ def parse_args():
     )
     parser.add_argument(
         "--ssh-node-ip",
-        help="IP of master-0-0 for the core SSH preflight (defaults to --api-address)",
+        help=(
+            "Optional IP override for master-0-0 SSH preflight "
+            "(defaults to its verified node IP)"
+        ),
     )
     parser.add_argument(
         "--kubeconfig",
@@ -282,15 +285,22 @@ def validate_args(args):
         )
     if not 1 <= args.source_primary_subnet <= 254:
         raise CaptureError("--source-primary-subnet must be between 1 and 254")
+    args.ssh_node_ip_explicit = args.ssh_node_ip is not None
     try:
         api_address = ipaddress.ip_address(args.api_address)
-        ssh_node_ip = ipaddress.ip_address(args.ssh_node_ip or args.api_address)
-        if not isinstance(api_address, ipaddress.IPv4Address) or not isinstance(
-            ssh_node_ip, ipaddress.IPv4Address
+        ssh_node_ip = (
+            ipaddress.ip_address(args.ssh_node_ip)
+            if args.ssh_node_ip_explicit
+            else None
+        )
+        if not isinstance(api_address, ipaddress.IPv4Address) or (
+            ssh_node_ip is not None
+            and not isinstance(ssh_node_ip, ipaddress.IPv4Address)
         ):
             raise CaptureError("The compact capture workflow requires IPv4 API and SSH addresses")
         args.api_address = str(api_address)
-        args.ssh_node_ip = str(ssh_node_ip)
+        if ssh_node_ip is not None:
+            args.ssh_node_ip = str(ssh_node_ip)
     except ValueError as error:
         raise CaptureError("Invalid API or SSH address") from error
     if not re.fullmatch(r"[A-Za-z0-9.-]+", args.api_server_name):
@@ -733,6 +743,13 @@ def collect_source_plan(args):
     return domains, plan
 
 
+def ssh_preflight_address(args, node_name, node_ips):
+    """Use an explicit master-0-0 SSH override, or its verified node IP."""
+    if node_name == "master-0-0" and args.ssh_node_ip_explicit:
+        return args.ssh_node_ip
+    return node_ips[node_name]
+
+
 def preflight_ssh(args, public_key, node_ips):
     """Verify SSH access and read each source node's interface identity."""
     identity = Path(args.ssh_identity).expanduser()
@@ -749,9 +766,7 @@ def preflight_ssh(args, public_key, node_ips):
     if len(derived_key) < 2 or len(supplied_key) < 2 or derived_key[:2] != supplied_key[:2]:
         raise CaptureError("SSH public key does not match the private identity")
     for node_name in NODE_NAMES:
-        ssh_address = (
-            args.ssh_node_ip if node_name == "master-0-0" else node_ips[node_name]
-        )
+        ssh_address = ssh_preflight_address(args, node_name, node_ips)
         command = [
             "ssh",
             "-i",
@@ -1039,6 +1054,12 @@ def capture_disks(args, plan, stage_dir):
                 )
         finally:
             os.umask(previous_umask)
+        if method == "reflink":
+            # Repair only the copy: reflink CoW keeps the source image untouched.
+            run(
+                ["qemu-img", "check", "-r", "leaks", "-f", "qcow2", destination],
+                timeout=600,
+            )
         run(["qemu-img", "check", "-f", "qcow2", destination])
         output_info = image_info(destination)
         expected_size = plan[(index, target)]["info"]["virtual-size"]
