@@ -152,7 +152,12 @@ class TestCompactFlavorCapture(unittest.TestCase):
                 virtual_size = (80 if target == "vda" else 132) * 1024**3
                 plan[(index, target)] = {
                     "path": Path(f"/source/{filename}"),
-                    "info": {"format": "qcow2", "virtual-size": virtual_size},
+                    "capture_method": "reflink",
+                    "info": {
+                        "format": "qcow2",
+                        "virtual-size": virtual_size,
+                        "snapshots": [],
+                    },
                 }
                 sizes[filename] = virtual_size
 
@@ -198,6 +203,154 @@ class TestCompactFlavorCapture(unittest.TestCase):
                     ["check", "-f", "qcow2"],
                 )
 
+    def test_qcow2_with_internal_snapshots_uses_convert(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stage_dir = Path(temp_dir)
+            plan = {}
+            sizes = {}
+            copy_destinations = []
+            for index, target, filename, _kind in capture.DISK_LAYOUT:
+                virtual_size = (80 if target == "vda" else 132) * 1024**3
+                info = {"format": "qcow2", "virtual-size": virtual_size}
+                if (index, target) == (0, "vda"):
+                    info["snapshots"] = [{"id": "old-state"}]
+                else:
+                    info["snapshots"] = []
+                plan[(index, target)] = {
+                    "path": Path(f"/source/{filename}"),
+                    "capture_method": (
+                        "convert" if (index, target) == (0, "vda") else "reflink"
+                    ),
+                    "info": info,
+                }
+                sizes[filename] = virtual_size
+
+            def reflink_copy(command, **_kwargs):
+                copy_destinations.append(command[-1])
+                Path(command[-1]).write_bytes(b"reflink qcow2")
+                return MagicMock(returncode=0)
+
+            def convert(command, **_kwargs):
+                Path(command[-1]).write_bytes(b"converted active layer")
+                return 0.1
+
+            with patch.object(capture.subprocess, "run", side_effect=reflink_copy), \
+                 patch.object(capture, "run", return_value=b""), \
+                 patch.object(capture, "run_visible", side_effect=convert) as run_visible, \
+                 patch.object(capture, "ensure_conversion_space") as conversion_space, \
+                 patch.object(
+                     capture,
+                     "image_info",
+                     side_effect=lambda path: {
+                         "virtual-size": sizes[Path(path).name],
+                         "actual-size": 1024,
+                     },
+                 ), \
+                 patch.object(capture.shutil, "chown"):
+                capture.capture_disks(argparse.Namespace(), plan, stage_dir)
+
+            snapshot_disk = str(stage_dir / "disk-0.qcow2")
+            self.assertNotIn(snapshot_disk, copy_destinations)
+            self.assertEqual(len(copy_destinations), 5)
+            self.assertEqual(run_visible.call_count, 1)
+            self.assertIn(
+                Path("/source/disk-0.qcow2"), run_visible.call_args.args[0]
+            )
+            conversion_space.assert_called_once_with(
+                stage_dir, plan[(0, "vda")], 1
+            )
+
+    def test_preflight_selects_capture_methods_before_downtime(self):
+        plan = {}
+        for index, target, filename, _kind in capture.DISK_LAYOUT:
+            info = {
+                "format": "qcow2",
+                "virtual-size": (80 if target == "vda" else 132) * 1024**3,
+                "snapshots": [],
+            }
+            if (index, target) == (0, "vda"):
+                info["snapshots"] = [{"id": "old-state"}]
+            if (index, target) == (0, "vdb"):
+                info["format"] = "raw"
+            plan[(index, target)] = {
+                "path": Path(f"/source/{filename}"),
+                "capture_method": (
+                    "convert" if (index, target) == (0, "vda") else "reflink"
+                ),
+                "info": info,
+            }
+
+        with patch.object(
+            capture,
+            "probe_reflink",
+            side_effect=lambda source, _destination: "disk-1.qcow2" not in str(source),
+        ) as probe:
+            capture.prepare_capture_methods(Path("/capture"), plan)
+
+        self.assertEqual(probe.call_count, 4)
+        self.assertEqual(plan[(0, "vda")]["capture_method"], "convert")
+        self.assertEqual(plan[(0, "vdb")]["capture_method"], "convert")
+        self.assertEqual(plan[(1, "vda")]["capture_method"], "convert")
+        self.assertEqual(plan[(2, "vda")]["capture_method"], "reflink")
+        self.assertEqual(plan[(2, "vdb")]["capture_method"], "reflink")
+
+    def test_space_preflight_reserves_virtual_capacity_for_conversions(self):
+        convert_size = 80 * 1024**3
+        reflink_size = 132 * 1024**3
+        required = (
+            int(convert_size * 1.15) + 1024**3
+            + int(10 * 1024**3 * 1.15) + 1024**3
+        )
+        plan = {
+            (0, "vda"): {
+                "capture_method": "convert",
+                "info": {
+                    "virtual-size": convert_size,
+                    "actual-size": 1024**3,
+                },
+            },
+            (0, "vdb"): {
+                "capture_method": "reflink",
+                "info": {
+                    "virtual-size": reflink_size,
+                    "actual-size": 10 * 1024**3,
+                },
+            },
+        }
+
+        with patch.object(
+            capture.shutil,
+            "disk_usage",
+            return_value=MagicMock(free=required - 1),
+        ):
+            with self.assertRaisesRegex(capture.CaptureError, "Not enough free space"):
+                capture.ensure_free_space(Path("/capture"), plan)
+
+    def test_preflight_reflink_failure_does_not_start_unreserved_conversion(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stage_dir = Path(temp_dir)
+            source = Path("/source/disk-0.qcow2")
+            item = {
+                "path": source,
+                "capture_method": "reflink",
+                "info": {
+                    "format": "qcow2",
+                    "virtual-size": 80 * 1024**3,
+                    "snapshots": [],
+                },
+            }
+            plan = {(0, "vda"): item}
+
+            with patch.object(
+                capture.subprocess,
+                "run",
+                return_value=MagicMock(returncode=1),
+            ), patch.object(capture, "run_visible") as convert:
+                with self.assertRaisesRegex(capture.CaptureError, "refusing an unreserved conversion"):
+                    capture.capture_disks(argparse.Namespace(), plan, stage_dir)
+
+            convert.assert_not_called()
+
     def test_conversion_space_uses_per_disk_virtual_size_bound(self):
         virtual_size = 80 * 1024**3
         required = int(virtual_size * 1.15) + 1024**3
@@ -231,6 +384,7 @@ class TestCompactFlavorCapture(unittest.TestCase):
                 virtual_size = (80 if target == "vda" else 132) * 1024**3
                 plan[(index, target)] = {
                     "path": Path(f"/source/{filename}"),
+                    "capture_method": "convert",
                     "info": {"format": "raw", "virtual-size": virtual_size},
                 }
                 sizes[filename] = virtual_size

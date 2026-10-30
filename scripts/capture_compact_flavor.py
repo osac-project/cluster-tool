@@ -1060,10 +1060,14 @@ def capture_disks(args, plan, stage_dir):
             f"({source_info.get('virtual-size', 0) // 1024**3} GiB)...",
             flush=True,
         )
+        method = item.get("capture_method")
+        if method not in {"reflink", "convert"}:
+            raise CaptureError(
+                f"Capture method for disk {disk_number} was not selected before shutdown"
+            )
         previous_umask = os.umask(0o077)
         try:
-            method = "convert"
-            if source_info.get("format") == "qcow2":
+            if method == "reflink":
                 try:
                     result = subprocess.run(
                         ["cp", "--reflink=always", "--", str(source), str(destination)],
@@ -1071,23 +1075,26 @@ def capture_disks(args, plan, stage_dir):
                         stderr=subprocess.DEVNULL,
                         timeout=60,
                     )
-                    if result.returncode == 0:
-                        method = "reflink"
-                    else:
-                        destination.unlink(missing_ok=True)
-                except (OSError, subprocess.TimeoutExpired):
+                except (OSError, subprocess.TimeoutExpired) as error:
                     destination.unlink(missing_ok=True)
-                if method == "convert":
-                    print(
-                        "  reflink unavailable; using qemu-img convert",
-                        flush=True,
+                    raise CaptureError(
+                        f"Reflink capture failed for disk {disk_number} after preflight; "
+                        "refusing an unreserved conversion"
+                    ) from error
+                if result.returncode:
+                    destination.unlink(missing_ok=True)
+                    raise CaptureError(
+                        f"Reflink capture failed for disk {disk_number} after preflight; "
+                        "refusing an unreserved conversion"
                     )
-            if method == "convert":
+            elif method == "convert":
                 ensure_conversion_space(stage_dir, item, disk_number)
                 run_visible(
                     ["qemu-img", "convert", "-p", "-O", "qcow2", source, destination],
                     timeout=3600,
                 )
+            else:
+                raise CaptureError(f"Unknown preflight capture method for disk {disk_number}")
         finally:
             os.umask(previous_umask)
         if method == "reflink":
@@ -1132,22 +1139,76 @@ def ensure_libvirt_account():
         ) from error
 
 
-def ensure_free_space(destination_dir, plan):
-    """Estimate capture output from allocated source data plus a safety margin."""
-    allocated_total = 0
-    virtual_total = 0
-    virtual_size_fallbacks = 0
+def probe_reflink(source, destination_dir):
+    """Check whether this source can be reflinked into the capture filesystem."""
+    with tempfile.TemporaryDirectory(
+        prefix=".reflink-probe-", dir=destination_dir
+    ) as probe_dir:
+        destination = Path(probe_dir) / "probe.qcow2"
+        try:
+            result = subprocess.run(
+                ["cp", "--reflink=always", "--", str(source), str(destination)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=60,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return result.returncode == 0
+
+
+def prepare_capture_methods(destination_dir, plan):
+    """Select reflink or conversion for every disk before source downtime."""
+    reflink_count = 0
+    conversion_count = 0
     for item in plan.values():
         info = item["info"]
+        if (
+            info.get("format") == "qcow2"
+            and not info.get("snapshots")
+            and probe_reflink(item["path"], destination_dir)
+        ):
+            item["capture_method"] = "reflink"
+            reflink_count += 1
+        else:
+            item["capture_method"] = "convert"
+            conversion_count += 1
+    print(
+        "Capture method preflight: "
+        f"{reflink_count} disk(s) use reflink, "
+        f"{conversion_count} disk(s) use qemu-img convert."
+    )
+
+
+def ensure_free_space(destination_dir, plan):
+    """Reserve allocated-data estimates and per-disk conversion bounds."""
+    reflink_allocated_total = 0
+    virtual_total = 0
+    virtual_size_fallbacks = 0
+    conversion_required = 0
+    conversion_count = 0
+    for item in plan.values():
+        if item.get("capture_method") not in {"reflink", "convert"}:
+            raise CaptureError("Capture methods must be selected before the space preflight")
+        info = item["info"]
         virtual_size = int(info["virtual-size"])
+        virtual_total += virtual_size
+        if item.get("capture_method") == "convert":
+            conversion_required += int(virtual_size * 1.15) + 1024**3
+            conversion_count += 1
+            continue
         allocated_size = info.get("actual-size")
         if not isinstance(allocated_size, int) or allocated_size <= 0:
             allocated_size = virtual_size
             virtual_size_fallbacks += 1
-        allocated_total += allocated_size
-        virtual_total += virtual_size
+        reflink_allocated_total += allocated_size
 
-    required = int(allocated_total * 1.15) + 1024**3
+    reflink_required = (
+        int(reflink_allocated_total * 1.15) + 1024**3
+        if reflink_allocated_total
+        else 0
+    )
+    required = reflink_required + conversion_required
     usage = shutil.disk_usage(destination_dir)
     if usage.free < required:
         raise CaptureError(
@@ -1155,8 +1216,9 @@ def ensure_free_space(destination_dir, plan):
             f"{required / 1024**3:.1f} GiB, have {usage.free / 1024**3:.1f} GiB"
         )
     print(
-        f"Capture estimate: {allocated_total / 1024**3:.1f} GiB allocated "
-        f"across source disks (virtual capacity {virtual_total / 1024**3:.1f} GiB); "
+        f"Capture reserve: {reflink_allocated_total / 1024**3:.1f} GiB allocated-data "
+        f"estimate plus {conversion_count} per-disk conversion reserve(s) "
+        f"(virtual capacity {virtual_total / 1024**3:.1f} GiB); "
         f"{usage.free / 1024**3:.1f} GiB available."
     )
     if virtual_size_fallbacks:
@@ -1363,6 +1425,7 @@ def main():
     rhcos_deployment = read_booted_ostree_deployment(args, node_ips, identity)
     domains, plan = collect_source_plan(args)
     verify_domain_node_bindings(args, domains, node_ips, identity)
+    prepare_capture_methods(flavors_dir, plan)
     ensure_free_space(flavors_dir, plan)
     ensure_libvirt_account()
 

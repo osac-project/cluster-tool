@@ -57,6 +57,8 @@ Have the following information ready:
 - A kubeconfig with cluster-admin access, the reachable API IP, and a DNS name
   present in the API serving certificate. The script uses the IP for the
   connection and the DNS name for TLS verification.
+- SSH preflight uses each node's verified InternalIP. Pass `--ssh-node-ip` only
+  if master-0-0's InternalIP cannot be reached directly.
 - Each libvirt domain must expose its guest interface MAC in domain XML, and
   SSH to each API node must be able to run `ip -j -4 address show`. The script
   matches each node's InternalIP interface MAC to its VM before shutdown.
@@ -65,9 +67,25 @@ Have the following information ready:
   non-interactively and have mode 0600. Its matching .pub file must be next
   to it unless --ssh-public-key is provided.
 - Enough free space on the filesystem that contains the configured
-  CLUSTER_TOOL_DATA/flavors directory. The preflight sums each standalone source disk's qemu-img `actual-size` when available, falling back to its virtual size if the allocated size is missing or invalid. It requires a 15% margin plus 1 GiB. Disks with backing files are rejected before downtime so the estimate cannot omit allocated data from a backing layer; flatten or consolidate those disks first. The captured qcow2 files can be smaller when the source contains sparse or zero-filled regions.
+  CLUSTER_TOOL_DATA/flavors directory. Before shutdown, the script probes
+  whether each eligible qcow2 can be reflinked to that filesystem. For planned
+  reflinks, it estimates from qemu-img `actual-size`, falling back to virtual
+  size when that value is missing or invalid, and adds a 15% margin plus 1 GiB.
+  For every disk planned for `qemu-img convert`, it reserves that disk's
+  `virtual-size * 1.15 + 1 GiB`. Disks with backing files are rejected before
+  downtime so the estimate cannot omit allocated data from a backing layer;
+  flatten or consolidate those disks first. The captured qcow2 files can be
+  smaller when the source contains sparse or zero-filled regions.
 
-For standalone qcow2 inputs, capture first tries a filesystem reflink. If the source and destination filesystems cannot reflink, it falls back to `qemu-img convert`. Conversion progress is shown as a percentage, and each verified disk reports its capture method, allocated output size, and elapsed time.
+Before asking for downtime, capture selects the method for every disk. It uses
+reflink for qcow2 inputs without internal snapshots when the source can be
+reflinked to the destination filesystem. Disks with internal snapshots use
+`qemu-img convert` so the captured image contains only the active disk state;
+other disks also use conversion when reflink is unavailable. If a reflink that
+passed preflight unexpectedly fails during capture, the script aborts and
+restores the source VMs instead of starting a conversion without its space
+reserve. Conversion progress is shown as a percentage, and each verified disk
+reports its capture method, allocated output size, and elapsed time.
 
 The source VMs must be running when you start. The capture gracefully shuts
 down all three VMs while copying disks, so the source cluster will be
@@ -87,7 +105,6 @@ source cluster. If the VM names have a prefix before master-0-N, pass it with
       --source-primary-subnet 123 \
       --api-address 192.168.123.10 \
       --api-server-name api.assisted.example.com \
-      --ssh-node-ip 192.168.123.10 \
       --kubeconfig /path/to/admin.kubeconfig \
       --ssh-identity /path/to/core-ssh-key
 
