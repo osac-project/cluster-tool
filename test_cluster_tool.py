@@ -3949,6 +3949,28 @@ class TestSnapshot(unittest.TestCase):
         self.assertIn("if ! umount", argv[2])
         self.assertIn("'/tmp/disk with spaces.qcow2'", argv[2])
 
+    def test_offline_root_growth_skips_partition_nodes_when_nbd_is_busy(self):
+        with patch.object(ct.env, "run") as run:
+            ct.grow_rhcos_root_disk("/tmp/disk.qcow2")
+        script = shlex.split(run.call_args.args[0])[2]
+        loop = script.split('nbd=""\n', 1)[1].split('[ -n "$nbd" ]', 1)[0]
+        self.assertIn('[ -b "$candidate" ] || continue', loop)
+        self.assertIn('[ ! -e "/sys/block/${candidate##*/}/pid" ] || continue', loop)
+
+        with tempfile.TemporaryDirectory(prefix="cluster-tool-nbd-") as directory:
+            root = Path(directory)
+            for name in ("nbd0", "nbd0p1", "nbd1"):
+                (root / name).touch()
+            (root / "busy" / "nbd0").mkdir(parents=True)
+            (root / "busy" / "nbd0" / "pid").touch()
+            loop = loop.replace("/dev/nbd[0-9]*", f"{shlex.quote(directory)}/nbd[0-9]*")
+            loop = loop.replace('[ -b "$candidate" ]', '[ -f "$candidate" ]')
+            loop = loop.replace('"/sys/block/${candidate##*/}/pid"',
+                                f'"{directory}/busy/${{candidate##*/}}/pid"')
+            result = subprocess.run(["bash", "-c", f'{loop}printf "%s" "$nbd"'],
+                                    capture_output=True, text=True, check=True)
+            self.assertEqual(result.stdout, str(root / "nbd1"))
+
     @patch("time.sleep")
     def test_snapshot_saves_flavor_state(self, _):
         ssh = self._make_ssh_mock()

@@ -407,6 +407,7 @@ exec 9>/run/lock/cluster-tool-nbd.lock
 flock -x 9
 nbd=""
 for candidate in /dev/nbd[0-9]*; do
+    [[ "${{candidate##*/}}" =~ ^nbd[0-9]+$ ]] || continue
     [ -b "$candidate" ] || continue
     [ ! -e "/sys/block/${{candidate##*/}}/pid" ] || continue
     nbd="$candidate"
