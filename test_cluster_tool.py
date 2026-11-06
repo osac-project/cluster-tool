@@ -3942,6 +3942,8 @@ class TestSnapshot(unittest.TestCase):
         self.assertEqual(argv[:2], ["bash", "-c"])
         subprocess.run(["bash", "-n", "-c", argv[2]], check=True)
         self.assertIn("blkid -o value -s PARTLABEL", argv[2])
+        self.assertIn('lsblk -nr -o NAME,TYPE "$nbd"', argv[2])
+        self.assertNotIn('lsblk -ln -o PARTN', argv[2])
         self.assertIn('sgdisk -e "$nbd"\npartprobe "$nbd"\nparted', argv[2])
         self.assertIn("connected=1\nqemu-nbd --connect", argv[2])
         self.assertIn("if ! umount", argv[2])

@@ -438,7 +438,8 @@ for attempt in $(seq 1 10); do
     sleep 1
 done
 [ -b "$root" ] || {{ echo "Missing RHCOS root partition: $root" >&2; exit 1; }}
-[ "$(lsblk -ln -o PARTN "$nbd" | tail -1 | tr -d ' ')" = 4 ] || {{ echo 'RHCOS root is not the last partition' >&2; exit 1; }}
+last_partition=$(lsblk -nr -o NAME,TYPE "$nbd" | awk '$2 == "part" {{ last=$1 }} END {{ print last }}')
+[ "$last_partition" = "${{root##*/}}" ] || {{ echo 'RHCOS root is not the last partition' >&2; exit 1; }}
 [ "$(blkid -o value -s PARTLABEL "$root")" = root ] || {{ echo 'Expected RHCOS root partition label' >&2; exit 1; }}
 [ "$(blkid -o value -s TYPE "$root")" = xfs ] || {{ echo 'Expected XFS on RHCOS root partition' >&2; exit 1; }}
 sgdisk -e "$nbd"
