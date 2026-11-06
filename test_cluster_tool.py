@@ -4094,10 +4094,36 @@ class TestSnapshot(unittest.TestCase):
         self.assertIn('lsblk -nr -o NAME,TYPE "$nbd"', argv[2])
         self.assertNotIn('lsblk -ln -o PARTN', argv[2])
         self.assertIn('sgdisk -e "$nbd"\npartprobe "$nbd"\nparted', argv[2])
-        self.assertIn("connected=1\nqemu-nbd --connect", argv[2])
+        self.assertIn('qemu-nbd --connect="$nbd" --format=qcow2 "$1"\nconnected=1', argv[2])
         self.assertIn("if ! umount", argv[2])
         self.assertIn('qemu-nbd --connect="$nbd" --format=qcow2 "$1"', argv[2])
         self.assertNotIn("/tmp/disk with spaces.qcow2", argv[2])
+
+    def test_root_growth_disconnects_only_after_successful_connect(self):
+        with patch.object(ct.env, "run") as run:
+            ct.grow_rhcos_root_disk("/tmp/disk.qcow2")
+        script = run.call_args.args[0][2]
+        probe = script.split("mounted=0\n", 1)[1].split('root="${nbd}p4"', 1)[0]
+        setup = 'set -euo pipefail\nnbd=/dev/nbd-test\nmount_dir=$(mktemp -d)\nmounted=0\nconnected=0\n'
+
+        with tempfile.TemporaryDirectory(prefix="cluster-tool-nbd-connect-") as directory:
+            stub = Path(directory) / "qemu-nbd"
+            stub.write_text(
+                '#!/bin/sh\nprintf "%s\\n" "$1" >> "$NBD_LOG"\n'
+                'case "$1" in --connect=*) exit "$NBD_CONNECT_RESULT";; esac\n'
+            )
+            stub.chmod(0o755)
+            log = Path(directory) / "calls"
+            for fails in (True, False):
+                with self.subTest(connect_fails=fails):
+                    log.write_text("")
+                    environment = {**os.environ, "PATH": directory + os.pathsep + os.environ["PATH"],
+                                   "NBD_LOG": str(log), "NBD_CONNECT_RESULT": "7" if fails else "0"}
+                    result = subprocess.run(["bash", "-c", setup + probe, "--", "/tmp/disk.qcow2"],
+                                            env=environment, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 7 if fails else 0, result.stderr)
+                    self.assertEqual(log.read_text().splitlines(),
+                                     ["--connect=/dev/nbd-test"] + ([] if fails else ["--disconnect"]))
 
     def test_offline_root_growth_skips_partition_nodes_when_nbd_is_busy(self):
         with patch.object(ct.env, "run") as run:

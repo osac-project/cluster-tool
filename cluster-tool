@@ -434,8 +434,8 @@ cleanup() {{
     exit "$rc"
 }}
 trap cleanup EXIT
-connected=1
 qemu-nbd --connect="$nbd" --format=qcow2 "$1"
+connected=1
 root="${{nbd}}p4"
 for attempt in $(seq 1 10); do
     [ -b "$root" ] && break
