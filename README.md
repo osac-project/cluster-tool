@@ -136,10 +136,32 @@ Only needed if you need a custom cluster configuration that doesn't exist as a p
 # virsh list shows: test-infra-cluster-6ef80144-master-0
 # The source ID is the 8 hex chars: 6ef80144
 
-./cluster-tool snapshot --name my-flavor --source 6ef80144
+./cluster-tool snapshot --name my-flavor --source 6ef80144 \
+  --disk-size vda=200G --disk-size vdb=400G
 ./cluster-tool boot --flavor my-flavor --name my-test \
   --pull-secret /path/to/pull-secret.json
 ```
+
+`--disk-size` is optional and repeatable. Use the source VM's libvirt disk target
+names (`virsh domblklist <source-vm>`); sizes are **total virtual sizes** in
+whole GiB (`G`) or TiB (`T`), not increments. Unknown targets, duplicate entries,
+and shrinking are rejected. Only the **copied flavor disks** grow; the source VM
+is not resized. An enlarged first disk must use the standard unencrypted RHCOS
+layout (GPT partition 4 named `root`, XFS). Snapshot grows that root partition
+and filesystem offline, before any clone boots. For other disks, only virtual
+capacity changes: initialize a blank disk after boot, or grow existing guest
+partitions/LVM/filesystems separately. A larger virtual disk alone does not
+resolve a full guest filesystem or host disk.
+
+Growing the first disk requires `qemu-nbd`, `sgdisk` (gdisk), `parted`,
+`partprobe`, `xfs_growfs`, `blkid`, `lsblk`, `flock`, and `modprobe` on the
+snapshot host with root privileges and an available NBD device. If the root
+layout differs (for example, LUKS), capture fails rather than attempting to
+edit it. Allow time for the existing disk conversion and subsequent flavor
+push/pull; the extra virtual capacity is sparse, but root filesystem growth
+can allocate metadata. Verify with `qemu-img info <flavor>/disk-0.qcow2` and
+`df -hT /` on a booted clone. This option is for single-node `snapshot`, not
+`scripts/capture_compact_flavor.py`.
 
 ### Capture a three-node compact flavor
 
@@ -227,7 +249,7 @@ For CI, use `local` as the host when running directly on the baremetal machine:
 | `connect NAME --host HOST [--data-path PATH]` | Connect to a baremetal server. Installs packages, configures storage, registers the server locally. |
 | `servers` | List all connected servers with default marker. |
 | `use NAME` | Set the default server. |
-| `snapshot --name NAME --source ID` | Create a snapshot flavor from a running cluster. Flattens disks, extracts crypto keys, injects SSH key. The private key is stored in the flavor's `crypto/` dir and travels with push/pull. |
+| `snapshot --name NAME --source ID [--disk-size TARGET=SIZE ...]` | Create a snapshot flavor from a running cluster. Optionally grow selected captured disks and the first disk's RHCOS root filesystem. The private key is stored in the flavor's `crypto/` dir and travels with push/pull. |
 | `boot --flavor NAME --pull-secret FILE [--name ID] [--server S]` | Boot a fresh SNO clone. Creates overlays, networks, runs recert, waits for operators, and injects the required pull secret. If `--name` is omitted, a random 8-character hex ID is generated. |
 | `list [--server S]` | Show running clones. |
 | `flavors [--delete NAME] [--server S]` | List or delete flavors. |
@@ -344,8 +366,8 @@ If any step fails, all resources are rolled back automatically (transactional bo
 4. **Copy SSH keypair** — store in the flavor's crypto dir (travels with push/pull).
 5. **Prepare etcd for clean boot** — hardlink etcd cert files to prevent revision rollouts (see [INTERNALS.md](INTERNALS.md)).
 6. **Shut down VM** — graceful shutdown, wait for "shut off".
-7. **Flatten disk(s)** — `qemu-img convert` produces standalone qcow2 (no backing file dependencies).
-8. **Restart VM** — bring the source cluster back up.
+7. **Flatten disk(s)** — `qemu-img convert` produces standalone qcow2 (no backing file dependencies). Requested disk sizes grow the copied images; when the first disk grows, its RHCOS root partition and XFS filesystem grow offline.
+8. **Restart VM** — bring the source cluster back up, including when disk growth fails.
 
 ## Architecture
 

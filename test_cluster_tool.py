@@ -3752,8 +3752,8 @@ class TestSnapshot(unittest.TestCase):
         self.mock_env.setup({"flavors": {}, "clones": {}})
         self.calls = []
 
-    def _snapshot_args(self):
-        return argparse.Namespace(name="test-snap", source="aabb1122")
+    def _snapshot_args(self, disk_sizes=None):
+        return argparse.Namespace(name="test-snap", source="aabb1122", disk_sizes=disk_sizes or [])
 
     _DOMINFO = (
         "Id:             1\nName:           test-infra-cluster-aabb1122-master-0\n"
@@ -3803,6 +3803,8 @@ class TestSnapshot(unittest.TestCase):
             elif "podman image exists" in cmd:
                 r.returncode = 1
                 r.stdout = ""
+            elif "qemu-img info" in cmd:
+                r.stdout = json.dumps({"virtual-size": 80 * 1024**3})
             else:
                 r.stdout = ""
             return r
@@ -3824,6 +3826,126 @@ class TestSnapshot(unittest.TestCase):
 
         cp_cmds = [c for c in self.calls if "cp --sparse" in c]
         self.assertEqual(len(cp_cmds), 0)
+
+    def test_snapshot_disk_size_cli_option(self):
+        result = subprocess.run(
+            [sys.executable, "./cluster-tool", "snapshot", "--help"],
+            capture_output=True, text=True, check=True,
+        )
+        self.assertIn("--disk-size", result.stdout)
+
+    def test_snapshot_disk_size_validation(self):
+        disks = [{"target": "vda", "path": "/images/os.qcow2"},
+                 {"target": "vdb", "path": "/images/data.qcow2"}]
+        self.assertEqual(
+            ct.parse_snapshot_disk_sizes(["vda=200G", "vdb=1T"], disks),
+            {"vda": 200 * 1024**3, "vdb": 1024**4},
+        )
+        for options in (["vdc=200G"], ["vda=0G"], ["vda=-1G"],
+                        ["vda=200G", "vda=300G"], ["vda=200;bad"], ["vda=3.5T"]):
+            with self.subTest(options=options), self.assertRaises(SystemExit):
+                ct.parse_snapshot_disk_sizes(options, disks)
+
+    @patch("time.sleep")
+    def test_snapshot_resizes_only_selected_copied_disks(self, _):
+        self._DUMPXML = (
+            "<domain><devices>"
+            "<disk type='file' device='disk'><source file='/data/os.qcow2'/>"
+            "<target dev='vda' bus='virtio'/></disk>"
+            "<disk type='file' device='disk'><source file='/data/data.qcow2'/>"
+            "<target dev='vdb' bus='virtio'/></disk>"
+            "</devices></domain>"
+        )
+        ssh = self._make_ssh_mock()
+        with patch.object(ct.env, "run", side_effect=self.mock_env.wrap_run_positional(ssh)), \
+             patch.object(ct.env, "run_vm", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_snapshot(self._snapshot_args(["vdb=200G"]))
+        conversions = [i for i, c in enumerate(self.calls) if "qemu-img convert" in c]
+        resizes = [(i, c) for i, c in enumerate(self.calls) if "qemu-img resize" in c]
+        self.assertEqual(len(conversions), 2)
+        self.assertEqual(len(resizes), 1)
+        self.assertLess(conversions[1], resizes[0][0])
+        self.assertIn("disk-1.qcow2", resizes[0][1])
+        self.assertNotIn("disk-0.qcow2", resizes[0][1])
+        self.assertFalse(any("qemu-nbd" in c for c in self.calls))
+
+    @patch("time.sleep")
+    def test_snapshot_equal_size_does_not_modify_disk(self, _):
+        ssh = self._make_ssh_mock()
+        with patch.object(ct.env, "run", side_effect=self.mock_env.wrap_run_positional(ssh)), \
+             patch.object(ct.env, "run_vm", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_snapshot(self._snapshot_args(["sda=80G"]))
+        self.assertFalse(any("qemu-img resize" in c or "qemu-nbd --connect" in c
+                             for c in self.calls))
+
+    @patch("time.sleep")
+    def test_snapshot_rejects_shrinking_and_restarts_source(self, _):
+        ssh = self._make_ssh_mock()
+        with patch.object(ct.env, "run", side_effect=self.mock_env.wrap_run_positional(ssh)), \
+             patch.object(ct.env, "run_vm", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            with self.assertRaisesRegex(SystemExit, "shrink"):
+                ct.cmd_snapshot(self._snapshot_args(["sda=40G"]))
+        self.assertTrue(any("virsh start" in c for c in self.calls))
+        self.assertFalse(any("qemu-img resize" in c for c in self.calls))
+        self.assertNotIn("test-snap", self.mock_env.get_saved_state()["flavors"])
+
+    @patch("time.sleep")
+    def test_snapshot_grows_copied_os_root_offline(self, _):
+        ssh = self._make_ssh_mock()
+        with patch.object(ct.env, "run", side_effect=self.mock_env.wrap_run_positional(ssh)), \
+             patch.object(ct.env, "run_vm", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_snapshot(self._snapshot_args(["sda=200G"]))
+        script = next(c for c in self.calls if "qemu-nbd --connect" in c)
+        self.assertIn("disk-0.qcow2", script)
+        self.assertIn("sgdisk -e", script)
+        self.assertIn("resizepart 4", script)
+        self.assertIn("xfs_growfs", script)
+        self.assertIn("qemu-nbd --disconnect", script)
+        self.assertIn("trap", script)
+        self.assertLess(
+            next(i for i, c in enumerate(self.calls) if "qemu-img resize" in c),
+            self.calls.index(script),
+        )
+
+    @patch("time.sleep")
+    def test_snapshot_invalid_target_does_not_stop_source(self, _):
+        ssh = self._make_ssh_mock()
+        with patch.object(ct.env, "run", side_effect=self.mock_env.wrap_run_positional(ssh)), \
+             patch.object(ct.env, "run_vm", side_effect=ssh):
+            with self.assertRaisesRegex(SystemExit, "Unknown disk target"):
+                ct.cmd_snapshot(self._snapshot_args(["vdc=200G"]))
+        self.assertFalse(any("virsh shutdown" in c for c in self.calls))
+
+    @patch("time.sleep")
+    def test_snapshot_growth_failure_restarts_source_without_registering_flavor(self, _):
+        ssh = self._make_ssh_mock()
+        def fail_growth(*args, **kwargs):
+            if "qemu-nbd --connect" in args[0]:
+                raise SystemExit("offline growth failed")
+            return self.mock_env.wrap_run_positional(ssh)(*args, **kwargs)
+        with patch.object(ct.env, "run", side_effect=fail_growth), \
+             patch.object(ct.env, "run_vm", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            with self.assertRaisesRegex(SystemExit, "offline growth failed"):
+                ct.cmd_snapshot(self._snapshot_args(["sda=200G"]))
+        self.assertTrue(any("virsh start" in c for c in self.calls))
+        self.assertNotIn("test-snap", self.mock_env.get_saved_state()["flavors"])
+
+    def test_offline_root_growth_script_checks_layout_and_parses(self):
+        with patch.object(ct.env, "run") as run:
+            ct.grow_rhcos_root_disk("/tmp/disk with spaces.qcow2")
+        argv = shlex.split(run.call_args.args[0])
+        self.assertEqual(argv[:2], ["bash", "-c"])
+        subprocess.run(["bash", "-n", "-c", argv[2]], check=True)
+        self.assertIn("blkid -o value -s PARTLABEL", argv[2])
+        self.assertIn('sgdisk -e "$nbd"\npartprobe "$nbd"\nparted', argv[2])
+        self.assertIn("connected=1\nqemu-nbd --connect", argv[2])
+        self.assertIn("if ! umount", argv[2])
+        self.assertIn("'/tmp/disk with spaces.qcow2'", argv[2])
 
     @patch("time.sleep")
     def test_snapshot_saves_flavor_state(self, _):
