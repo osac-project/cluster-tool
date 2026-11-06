@@ -365,6 +365,7 @@ def parse_disk_paths(dumpxml_output, pool_name):
         source = disk.find("source")
         if target is None or source is None:
             continue
+        driver = disk.find("driver")
         path = None
         if source.get("file"):
             path = source.get("file")
@@ -374,7 +375,8 @@ def parse_disk_paths(dumpxml_output, pool_name):
                 f"{shlex.quote(source.get('volume'))}")
             path = r.stdout.strip()
         if path:
-            disks.append({"target": target.get("dev"), "path": path})
+            disks.append({"target": target.get("dev"), "path": path,
+                          "format": driver.get("type") if driver is not None else None})
     disks.sort(key=lambda d: d["target"])
     return disks
 
@@ -6799,8 +6801,9 @@ def cmd_snapshot(args):
     disk_sizes = parse_snapshot_disk_sizes(getattr(args, "disk_sizes", []), disks)
     for disk in disks:
         if disk["target"] in disk_sizes:
+            source_format = ["-f", disk["format"]] if disk["format"] else []
             current = json.loads(env.run(
-                ["qemu-img", "info", "-U", "--output=json", disk["path"]]
+                ["qemu-img", "info", "-U", *source_format, "--output=json", disk["path"]]
             ).stdout)["virtual-size"]
             requested = disk_sizes[disk["target"]]
             if requested < current:
@@ -6935,7 +6938,8 @@ def cmd_snapshot(args):
         for i, disk in enumerate(disks):
             dest = f"{fdir}/disk-{i}.qcow2"
             copied_disks.append(dest)
-            env.run(["qemu-img", "convert", "-O", "qcow2", disk["path"], dest])
+            source_format = ["-f", disk["format"]] if disk["format"] else []
+            env.run(["qemu-img", "convert", *source_format, "-O", "qcow2", disk["path"], dest])
             if disk["target"] in disk_sizes:
                 current = json.loads(env.run(
                     ["qemu-img", "info", "--output=json", dest]).stdout)["virtual-size"]

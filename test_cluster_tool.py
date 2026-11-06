@@ -1578,6 +1578,7 @@ Used memory:    67108864 KiB"""
         dumpxml = """<domain type='kvm'>
           <devices>
             <disk type='volume' device='disk'>
+              <driver name='qemu' type='qcow2'/>
               <source pool='test-pool' volume='disk-0'/>
               <target dev='sda' bus='scsi'/>
             </disk>
@@ -1587,6 +1588,7 @@ Used memory:    67108864 KiB"""
               <readonly/>
             </disk>
             <disk type='file' device='disk'>
+              <driver name='qemu' type='raw'/>
               <source file='/data/extra-disk.qcow2'/>
               <target dev='sdb' bus='scsi'/>
             </disk>
@@ -1596,8 +1598,16 @@ Used memory:    67108864 KiB"""
         self.assertEqual(len(disks), 2)
         self.assertEqual(disks[0]["target"], "sda")
         self.assertEqual(disks[0]["path"], "/resolved/pool/disk-0")
+        self.assertEqual(disks[0]["format"], "qcow2")
         self.assertEqual(disks[1]["target"], "sdb")
         self.assertEqual(disks[1]["path"], "/data/extra-disk.qcow2")
+        self.assertEqual(disks[1]["format"], "raw")
+
+    def test_parse_disk_paths_without_driver_format(self):
+        xml = ("<domain><devices><disk type='file' device='disk'>"
+               "<source file='/data/os.qcow2'/><target dev='sda'/>"
+               "</disk></devices></domain>")
+        self.assertIsNone(ct.parse_disk_paths(xml, "test-pool")[0]["format"])
 
     def test_parse_subnet(self):
         net_xml = """<network>
@@ -3910,6 +3920,34 @@ class TestSnapshot(unittest.TestCase):
                       qemu_commands)
         self.assertTrue(any(isinstance(cmd, list) and cmd[:2] == ["bash", "-c"]
                             for cmd in commands))
+
+    @patch("time.sleep")
+    def test_snapshot_preserves_source_formats_for_info_and_convert(self, _):
+        self._DUMPXML = (
+            "<domain><devices>"
+            "<disk type='file' device='disk'><driver name='qemu' type='qcow2'/>"
+            "<source file='/data/os.qcow2'/><target dev='sda' bus='scsi'/></disk>"
+            "<disk type='file' device='disk'><driver name='qemu' type='raw'/>"
+            "<source file='/data/data.raw'/><target dev='sdb' bus='scsi'/></disk>"
+            "</devices></domain>"
+        )
+        ssh = self._make_ssh_mock()
+        with patch.object(ct.env, "run", side_effect=self.mock_env.wrap_run_positional(ssh)) as run, \
+             patch.object(ct.env, "run_vm", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_snapshot(self._snapshot_args(["sda=200G", "sdb=200G"]))
+        commands = [call.args[0] for call in run.call_args_list if isinstance(call.args[0], list)]
+        for target, source, source_format, index in (("sda", "/data/os.qcow2", "qcow2", 0),
+                                                      ("sdb", "/data/data.raw", "raw", 1)):
+            with self.subTest(target=target):
+                dest = f"/data/cluster-tool/flavors/test-snap/disk-{index}.qcow2"
+                self.assertIn(["qemu-img", "info", "-U", "-f", source_format,
+                               "--output=json", source], commands)
+                self.assertIn(["qemu-img", "convert", "-f", source_format,
+                               "-O", "qcow2", source, dest], commands)
+                self.assertIn(["qemu-img", "info", "--output=json", dest], commands)
+                self.assertIn(["qemu-img", "resize", "-f", "qcow2", dest,
+                               str(200 * 1024**3)], commands)
 
     @patch("time.sleep")
     def test_snapshot_equal_size_does_not_modify_disk(self, _):
