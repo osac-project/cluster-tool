@@ -155,15 +155,16 @@ class ExecutionEnv:
         self.is_local = (host == "local")
 
     def run(self, cmd, *, check=True):
+        shell_cmd = shlex.join(cmd) if isinstance(cmd, (list, tuple)) else cmd
         if self.is_local:
-            r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            r = subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True, text=True)
         else:
             r = subprocess.run(
-                ["ssh"] + SSH_OPTS + [self.host, cmd],
+                ["ssh"] + SSH_OPTS + [self.host, shell_cmd],
                 capture_output=True, text=True,
             )
         if check and r.returncode != 0:
-            sys.exit(f"Command failed (exit {r.returncode}): {cmd}\n{r.stderr.strip()}")
+            sys.exit(f"Command failed (exit {r.returncode}): {shell_cmd}\n{r.stderr.strip()}")
         return r
 
     def run_vm(self, vm_ip, cmd, *, check=True, identity=None):
@@ -364,6 +365,7 @@ def parse_disk_paths(dumpxml_output, pool_name):
         source = disk.find("source")
         if target is None or source is None:
             continue
+        driver = disk.find("driver")
         path = None
         if source.get("file"):
             path = source.get("file")
@@ -373,9 +375,86 @@ def parse_disk_paths(dumpxml_output, pool_name):
                 f"{shlex.quote(source.get('volume'))}")
             path = r.stdout.strip()
         if path:
-            disks.append({"target": target.get("dev"), "path": path})
+            disks.append({"target": target.get("dev"), "path": path,
+                          "format": driver.get("type") if driver is not None else None})
     disks.sort(key=lambda d: d["target"])
     return disks
+
+
+def parse_snapshot_disk_sizes(specs, disks):
+    """Resolve requested virtual sizes by libvirt target, not disk position."""
+    targets = {disk["target"] for disk in disks}
+    sizes = {}
+    for spec in specs:
+        match = re.fullmatch(r"([a-z][a-z0-9]*)=([1-9][0-9]*)([GT])", spec)
+        if not match:
+            sys.exit(f"Invalid --disk-size '{spec}': expected TARGET=SIZE (e.g. vda=200G)")
+        target, value, unit = match.groups()
+        if target not in targets:
+            sys.exit(f"Unknown disk target '{target}'; available: {', '.join(sorted(targets))}")
+        if target in sizes:
+            sys.exit(f"Duplicate --disk-size for '{target}'")
+        sizes[target] = int(value) * (1024 ** (3 if unit == "G" else 4))
+    return sizes
+
+
+def grow_rhcos_root_disk(image):
+    """Grow the fourth (root) GPT partition and XFS in an offline flavor copy."""
+    # All NBD users share this lock; never guess /dev/nbd0 on a busy host.
+    script = f"""set -euo pipefail
+for tool in modprobe qemu-nbd flock lsblk blkid sgdisk parted partprobe mount umount xfs_growfs mktemp; do
+    command -v "$tool" >/dev/null || {{ echo "Missing required snapshot tool: $tool" >&2; exit 1; }}
+done
+modprobe nbd max_part=16
+exec 9>/run/lock/cluster-tool-nbd.lock
+flock -x 9
+nbd=""
+for candidate in /dev/nbd[0-9]*; do
+    [[ "${{candidate##*/}}" =~ ^nbd[0-9]+$ ]] || continue
+    [ -b "$candidate" ] || continue
+    [ ! -e "/sys/block/${{candidate##*/}}/pid" ] || continue
+    nbd="$candidate"
+    break
+done
+[ -n "$nbd" ] || {{ echo 'No free NBD device for root resize' >&2; exit 1; }}
+mount_dir=$(mktemp -d)
+connected=0
+mounted=0
+cleanup() {{
+    rc=$?
+    trap - EXIT
+    if [ "$mounted" -eq 1 ]; then
+        if ! umount "$mount_dir"; then
+            echo "Could not unmount $mount_dir; leaving $nbd connected for recovery" >&2
+            exit 1
+        fi
+    fi
+    if [ "$connected" -eq 1 ]; then qemu-nbd --disconnect "$nbd" || rc=1; fi
+    rmdir "$mount_dir" || rc=1
+    exit "$rc"
+}}
+trap cleanup EXIT
+qemu-nbd --connect="$nbd" --format=qcow2 "$1"
+connected=1
+root="${{nbd}}p4"
+for attempt in $(seq 1 10); do
+    [ -b "$root" ] && break
+    sleep 1
+done
+[ -b "$root" ] || {{ echo "Missing RHCOS root partition: $root" >&2; exit 1; }}
+last_partition=$(lsblk -nr -o NAME,TYPE "$nbd" | awk '$2 == "part" {{ last=$1 }} END {{ print last }}')
+[ "$last_partition" = "${{root##*/}}" ] || {{ echo 'RHCOS root is not the last partition' >&2; exit 1; }}
+[ "$(blkid -o value -s PARTLABEL "$root")" = root ] || {{ echo 'Expected RHCOS root partition label' >&2; exit 1; }}
+[ "$(blkid -o value -s TYPE "$root")" = xfs ] || {{ echo 'Expected XFS on RHCOS root partition' >&2; exit 1; }}
+sgdisk -e "$nbd"
+partprobe "$nbd"
+parted -s "$nbd" resizepart 4 100%
+partprobe "$nbd"
+mount -t xfs -o nouuid "$root" "$mount_dir"
+mounted=1
+xfs_growfs "$mount_dir"
+"""
+    env.run(["bash", "-c", script, "--", image])
 
 
 def parse_subnet(net_xml):
@@ -6699,9 +6778,13 @@ def cache_image(vm_ip, image, anchor_name):
 
 
 def cmd_snapshot(args):
-    state = load_state()
     flavor_name = args.name
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", flavor_name or ""):
+        sys.exit("Invalid flavor name: use letters, digits, dots, underscores, or dashes")
     source_id = args.source
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", source_id or ""):
+        sys.exit("Invalid source cluster ID: use letters, digits, underscores, or dashes")
+    state = load_state()
 
     if flavor_name in state["flavors"]:
         sys.exit(f"Flavor '{flavor_name}' already exists. Delete it first with 'cluster-tool flavors --delete {flavor_name}'.")
@@ -6715,6 +6798,19 @@ def cmd_snapshot(args):
 
     r = env.run(f"virsh dumpxml {vm_name}")
     disks = parse_disk_paths(r.stdout, f"test-infra-cluster-{source_id}")
+    disk_sizes = parse_snapshot_disk_sizes(getattr(args, "disk_sizes", []), disks)
+    for disk in disks:
+        if disk["target"] in disk_sizes:
+            source_format = ["-f", disk["format"]] if disk["format"] else []
+            current = json.loads(env.run(
+                ["qemu-img", "info", "-U", *source_format, "--output=json", disk["path"]]
+            ).stdout)["virtual-size"]
+            requested = disk_sizes[disk["target"]]
+            if requested < current:
+                sys.exit(f"Refusing to shrink {disk['target']} from {current} to {requested} bytes")
+    if disks and disks[0]["target"] in disk_sizes:
+        # Fail before shutting down the source if offline root growth is unavailable.
+        env.run("for tool in modprobe qemu-nbd flock lsblk blkid sgdisk parted partprobe mount umount xfs_growfs mktemp; do command -v \"$tool\" >/dev/null || exit 1; done")
 
     r = env.run(f"virsh net-dumpxml test-infra-net-{source_id}")
     src_primary_subnet = parse_subnet(r.stdout)
@@ -6837,15 +6933,38 @@ def cmd_snapshot(args):
     print_step(9, 11, "Creating directories", "done")
 
     print_step(10, 11, f"Copying {len(disks)} disk(s)")
-    for i, disk in enumerate(disks):
-        dest = f"{fdir}/disk-{i}.qcow2"
-        env.run(f"qemu-img convert -O qcow2 {disk['path']} {dest}")
-        env.run(f"chown qemu:qemu {dest}")
-    print_step(10, 11, f"Copying {len(disks)} disk(s)", "done")
-
-    print_step(11, 11, "Restarting source VM")
-    env.run(f"virsh start {vm_name}")
-    print_step(11, 11, "Restarting source VM", "done")
+    copied_disks = []
+    try:
+        for i, disk in enumerate(disks):
+            dest = f"{fdir}/disk-{i}.qcow2"
+            copied_disks.append(dest)
+            source_format = ["-f", disk["format"]] if disk["format"] else []
+            env.run(["qemu-img", "convert", *source_format, "-O", "qcow2", disk["path"], dest])
+            if disk["target"] in disk_sizes:
+                current = json.loads(env.run(
+                    ["qemu-img", "info", "--output=json", dest]).stdout)["virtual-size"]
+                requested = disk_sizes[disk["target"]]
+                if requested < current:
+                    sys.exit(f"Refusing to shrink {disk['target']} from {current} to {requested} bytes")
+                if requested > current:
+                    env.run(["qemu-img", "resize", "-f", "qcow2", dest, str(requested)])
+                    if i == 0:
+                        grow_rhcos_root_disk(dest)
+            env.run(["chown", "qemu:qemu", dest])
+        print_step(10, 11, f"Copying {len(disks)} disk(s)", "done")
+    except BaseException:
+        for dest in copied_disks:
+            # A failed unmount leaves qemu-nbd holding the image open for recovery.
+            if env.run(["fuser", "-s", "--", dest], check=False).returncode == 1:
+                removed = env.run(["rm", "-f", "--", dest], check=False)
+                if removed.returncode == 0:
+                    continue
+            print(f"Preserving failed disk copy {dest} for recovery", file=sys.stderr)
+        raise
+    finally:
+        print_step(11, 11, "Restarting source VM")
+        env.run(f"virsh start {vm_name}")
+        print_step(11, 11, "Restarting source VM", "done")
 
     with locked_state() as state:
         state["flavors"][flavor_name] = {
@@ -7801,6 +7920,8 @@ def main():
     snap_p = sub.add_parser("snapshot", help="Create a named snapshot flavor from a running cluster")
     snap_p.add_argument("--name", required=True, help="Flavor name (e.g., sno-64, sno-cnv)")
     snap_p.add_argument("--source", required=True, help="Source cluster ID (8 hex chars from VM name)")
+    snap_p.add_argument("--disk-size", dest="disk_sizes", action="append", default=[], metavar="TARGET=SIZE",
+                        help="Grow a captured disk by libvirt target (repeatable; e.g. vda=200G, vdb=1T)")
 
     boot_p = sub.add_parser("boot", help="Boot a fresh cluster from a snapshot flavor")
     boot_p.add_argument("--flavor", help="Flavor to boot from (default: most recent)")
