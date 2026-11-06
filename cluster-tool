@@ -155,15 +155,16 @@ class ExecutionEnv:
         self.is_local = (host == "local")
 
     def run(self, cmd, *, check=True):
+        shell_cmd = shlex.join(cmd) if isinstance(cmd, (list, tuple)) else cmd
         if self.is_local:
-            r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            r = subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True, text=True)
         else:
             r = subprocess.run(
-                ["ssh"] + SSH_OPTS + [self.host, cmd],
+                ["ssh"] + SSH_OPTS + [self.host, shell_cmd],
                 capture_output=True, text=True,
             )
         if check and r.returncode != 0:
-            sys.exit(f"Command failed (exit {r.returncode}): {cmd}\n{r.stderr.strip()}")
+            sys.exit(f"Command failed (exit {r.returncode}): {shell_cmd}\n{r.stderr.strip()}")
         return r
 
     def run_vm(self, vm_ip, cmd, *, check=True, identity=None):
@@ -432,7 +433,7 @@ cleanup() {{
 }}
 trap cleanup EXIT
 connected=1
-qemu-nbd --connect="$nbd" --format=qcow2 {shlex.quote(image)}
+qemu-nbd --connect="$nbd" --format=qcow2 "$1"
 root="${{nbd}}p4"
 for attempt in $(seq 1 10); do
     [ -b "$root" ] && break
@@ -451,7 +452,7 @@ mount -t xfs -o nouuid "$root" "$mount_dir"
 mounted=1
 xfs_growfs "$mount_dir"
 """
-    env.run(f"bash -c {shlex.quote(script)}")
+    env.run(["bash", "-c", script, "--", image])
 
 
 def parse_subnet(net_xml):
@@ -6778,8 +6779,10 @@ def cmd_snapshot(args):
     flavor_name = args.name
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", flavor_name or ""):
         sys.exit("Invalid flavor name: use letters, digits, dots, underscores, or dashes")
-    state = load_state()
     source_id = args.source
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", source_id or ""):
+        sys.exit("Invalid source cluster ID: use letters, digits, underscores, or dashes")
+    state = load_state()
 
     if flavor_name in state["flavors"]:
         sys.exit(f"Flavor '{flavor_name}' already exists. Delete it first with 'cluster-tool flavors --delete {flavor_name}'.")
@@ -6797,7 +6800,8 @@ def cmd_snapshot(args):
     for disk in disks:
         if disk["target"] in disk_sizes:
             current = json.loads(env.run(
-                f"qemu-img info -U --output=json {shlex.quote(disk['path'])}").stdout)["virtual-size"]
+                ["qemu-img", "info", "-U", "--output=json", disk["path"]]
+            ).stdout)["virtual-size"]
             requested = disk_sizes[disk["target"]]
             if requested < current:
                 sys.exit(f"Refusing to shrink {disk['target']} from {current} to {requested} bytes")
@@ -6931,24 +6935,24 @@ def cmd_snapshot(args):
         for i, disk in enumerate(disks):
             dest = f"{fdir}/disk-{i}.qcow2"
             copied_disks.append(dest)
-            env.run(f"qemu-img convert -O qcow2 {shlex.quote(disk['path'])} {shlex.quote(dest)}")
+            env.run(["qemu-img", "convert", "-O", "qcow2", disk["path"], dest])
             if disk["target"] in disk_sizes:
                 current = json.loads(env.run(
-                    f"qemu-img info --output=json {shlex.quote(dest)}").stdout)["virtual-size"]
+                    ["qemu-img", "info", "--output=json", dest]).stdout)["virtual-size"]
                 requested = disk_sizes[disk["target"]]
                 if requested < current:
                     sys.exit(f"Refusing to shrink {disk['target']} from {current} to {requested} bytes")
                 if requested > current:
-                    env.run(f"qemu-img resize -f qcow2 {shlex.quote(dest)} {requested}")
+                    env.run(["qemu-img", "resize", "-f", "qcow2", dest, str(requested)])
                     if i == 0:
                         grow_rhcos_root_disk(dest)
-            env.run(f"chown qemu:qemu {shlex.quote(dest)}")
+            env.run(["chown", "qemu:qemu", dest])
         print_step(10, 11, f"Copying {len(disks)} disk(s)", "done")
     except BaseException:
         for dest in copied_disks:
             # A failed unmount leaves qemu-nbd holding the image open for recovery.
-            if env.run(f"fuser -s -- {shlex.quote(dest)}", check=False).returncode == 1:
-                removed = env.run(f"rm -f -- {shlex.quote(dest)}", check=False)
+            if env.run(["fuser", "-s", "--", dest], check=False).returncode == 1:
+                removed = env.run(["rm", "-f", "--", dest], check=False)
                 if removed.returncode == 0:
                     continue
             print(f"Preserving failed disk copy {dest} for recovery", file=sys.stderr)

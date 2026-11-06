@@ -43,6 +43,10 @@ def _fixture_pem(kind, body):
     return f"{marker}\n{body}\n{end}".encode()
 
 
+def _command_text(command):
+    return shlex.join(command) if isinstance(command, (list, tuple)) else command
+
+
 class TestCompactFlavorCapture(unittest.TestCase):
     def capture_args(self, ssh_node_ip=None):
         return argparse.Namespace(
@@ -3746,6 +3750,25 @@ class TestFlavorState(unittest.TestCase):
         self.assertEqual(loaded["flavors"]["sno-64"]["vcpus"], 16)
 
 
+class TestExecutionEnvArgv(unittest.TestCase):
+    @patch("subprocess.run")
+    def test_local_argv_does_not_use_shell(self, run):
+        run.return_value.returncode = 0
+        argv = ["qemu-img", "info", "/data/image; echo not-a-command"]
+        ct.ExecutionEnv(host="local", host_ip="127.0.0.1").run(argv)
+        run.assert_called_once_with(argv, shell=False, capture_output=True, text=True)
+
+    @patch("subprocess.run")
+    def test_remote_argv_is_quoted_as_one_ssh_command(self, run):
+        run.return_value.returncode = 0
+        argv = ["qemu-img", "info", "/data/image; echo not-a-command"]
+        ct.ExecutionEnv(host="test@host", host_ip="10.0.0.1").run(argv)
+        run.assert_called_once_with(
+            ["ssh", *ct.SSH_OPTS, "test@host", shlex.join(argv)],
+            capture_output=True, text=True,
+        )
+
+
 class TestSnapshot(unittest.TestCase):
     def setUp(self):
         self.mock_env = MockStateEnv()
@@ -3774,7 +3797,7 @@ class TestSnapshot(unittest.TestCase):
     def _make_ssh_mock(self):
         shutdown_called = {"v": False}
         def ssh(*args, check=True, **kwargs):
-            cmd = args[-1]
+            cmd = _command_text(args[-1])
             self.calls.append(cmd)
             r = MagicMock()
             r.returncode = 0
@@ -3871,6 +3894,24 @@ class TestSnapshot(unittest.TestCase):
         self.assertFalse(any("qemu-nbd" in c for c in self.calls))
 
     @patch("time.sleep")
+    def test_snapshot_disk_commands_use_argument_arrays(self, _):
+        ssh = self._make_ssh_mock()
+        with patch.object(ct.env, "run", side_effect=self.mock_env.wrap_run_positional(ssh)) as run, \
+             patch.object(ct.env, "run_vm", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_snapshot(self._snapshot_args(["sda=200G"]))
+        commands = [call.args[0] for call in run.call_args_list]
+        qemu_commands = [cmd for cmd in commands if isinstance(cmd, list) and cmd[:1] == ["qemu-img"]]
+        self.assertIn(["qemu-img", "info", "-U", "--output=json", "/data/disk-0.qcow2"], qemu_commands)
+        self.assertIn(["qemu-img", "convert", "-O", "qcow2", "/data/disk-0.qcow2",
+                       "/data/cluster-tool/flavors/test-snap/disk-0.qcow2"], qemu_commands)
+        self.assertIn(["qemu-img", "resize", "-f", "qcow2",
+                       "/data/cluster-tool/flavors/test-snap/disk-0.qcow2", str(200 * 1024**3)],
+                      qemu_commands)
+        self.assertTrue(any(isinstance(cmd, list) and cmd[:2] == ["bash", "-c"]
+                            for cmd in commands))
+
+    @patch("time.sleep")
     def test_snapshot_equal_size_does_not_modify_disk(self, _):
         ssh = self._make_ssh_mock()
         with patch.object(ct.env, "run", side_effect=self.mock_env.wrap_run_positional(ssh)), \
@@ -3900,6 +3941,14 @@ class TestSnapshot(unittest.TestCase):
                 run.side_effect = SystemExit("unvalidated name reached command runner")
                 with self.assertRaisesRegex(SystemExit, "Invalid flavor name"):
                     ct.cmd_snapshot(argparse.Namespace(name=name, source="aabb1122", disk_sizes=[]))
+                run.assert_not_called()
+
+    def test_snapshot_rejects_unsafe_source_before_running_commands(self):
+        for source in ("../outside", "dev;touch /tmp/injected", "dev with spaces"):
+            with self.subTest(source=source), patch.object(ct.env, "run") as run:
+                run.side_effect = SystemExit("unvalidated source reached command runner")
+                with self.assertRaisesRegex(SystemExit, "Invalid source cluster ID"):
+                    ct.cmd_snapshot(argparse.Namespace(name="safe-name", source=source, disk_sizes=[]))
                 run.assert_not_called()
 
     @patch("time.sleep")
@@ -3934,10 +3983,11 @@ class TestSnapshot(unittest.TestCase):
     def test_snapshot_growth_failure_restarts_source_without_registering_flavor(self, _):
         ssh = self._make_ssh_mock()
         def fail_growth(*args, **kwargs):
-            if "qemu-nbd --connect" in args[0]:
+            cmd = _command_text(args[0])
+            if "qemu-nbd --connect" in cmd:
                 raise SystemExit("offline growth failed")
-            if "fuser -s" in args[0]:
-                self.calls.append(args[0])
+            if "fuser -s" in cmd:
+                self.calls.append(cmd)
                 return MagicMock(returncode=1)
             return self.mock_env.wrap_run_positional(ssh)(*args, **kwargs)
         with patch.object(ct.env, "run", side_effect=fail_growth), \
@@ -3954,7 +4004,7 @@ class TestSnapshot(unittest.TestCase):
     def test_snapshot_preserves_busy_copy_after_growth_failure(self, _):
         ssh = self._make_ssh_mock()
         def fail_growth(*args, **kwargs):
-            if "qemu-nbd --connect" in args[0]:
+            if "qemu-nbd --connect" in _command_text(args[0]):
                 raise SystemExit("Could not unmount; leaving NBD connected")
             return self.mock_env.wrap_run_positional(ssh)(*args, **kwargs)
         with patch.object(ct.env, "run", side_effect=fail_growth), \
@@ -3977,11 +4027,12 @@ class TestSnapshot(unittest.TestCase):
         )
         ssh = self._make_ssh_mock()
         def fail_conversion(*args, **kwargs):
-            if "qemu-img convert" in args[0] and "disk-1.qcow2" in args[0]:
-                self.calls.append(args[0])
+            cmd = _command_text(args[0])
+            if "qemu-img convert" in cmd and "disk-1.qcow2" in cmd:
+                self.calls.append(cmd)
                 raise SystemExit("conversion failed")
-            if "fuser -s" in args[0]:
-                self.calls.append(args[0])
+            if "fuser -s" in cmd:
+                self.calls.append(cmd)
                 return MagicMock(returncode=1)
             return self.mock_env.wrap_run_positional(ssh)(*args, **kwargs)
         with patch.object(ct.env, "run", side_effect=fail_conversion), \
@@ -3997,8 +4048,9 @@ class TestSnapshot(unittest.TestCase):
     def test_offline_root_growth_script_checks_layout_and_parses(self):
         with patch.object(ct.env, "run") as run:
             ct.grow_rhcos_root_disk("/tmp/disk with spaces.qcow2")
-        argv = shlex.split(run.call_args.args[0])
+        argv = run.call_args.args[0]
         self.assertEqual(argv[:2], ["bash", "-c"])
+        self.assertEqual(argv[-2:], ["--", "/tmp/disk with spaces.qcow2"])
         subprocess.run(["bash", "-n", "-c", argv[2]], check=True)
         self.assertIn("blkid -o value -s PARTLABEL", argv[2])
         self.assertIn('lsblk -nr -o NAME,TYPE "$nbd"', argv[2])
@@ -4006,12 +4058,13 @@ class TestSnapshot(unittest.TestCase):
         self.assertIn('sgdisk -e "$nbd"\npartprobe "$nbd"\nparted', argv[2])
         self.assertIn("connected=1\nqemu-nbd --connect", argv[2])
         self.assertIn("if ! umount", argv[2])
-        self.assertIn("'/tmp/disk with spaces.qcow2'", argv[2])
+        self.assertIn('qemu-nbd --connect="$nbd" --format=qcow2 "$1"', argv[2])
+        self.assertNotIn("/tmp/disk with spaces.qcow2", argv[2])
 
     def test_offline_root_growth_skips_partition_nodes_when_nbd_is_busy(self):
         with patch.object(ct.env, "run") as run:
             ct.grow_rhcos_root_disk("/tmp/disk.qcow2")
-        script = shlex.split(run.call_args.args[0])[2]
+        script = run.call_args.args[0][2]
         loop = script.split('nbd=""\n', 1)[1].split('[ -n "$nbd" ]', 1)[0]
         self.assertIn('[ -b "$candidate" ] || continue', loop)
         self.assertIn('[ ! -e "/sys/block/${candidate##*/}/pid" ] || continue', loop)
