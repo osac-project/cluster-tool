@@ -6775,8 +6775,10 @@ def cache_image(vm_ip, image, anchor_name):
 
 
 def cmd_snapshot(args):
-    state = load_state()
     flavor_name = args.name
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", flavor_name or ""):
+        sys.exit("Invalid flavor name: use letters, digits, dots, underscores, or dashes")
+    state = load_state()
     source_id = args.source
 
     if flavor_name in state["flavors"]:
@@ -6792,6 +6794,13 @@ def cmd_snapshot(args):
     r = env.run(f"virsh dumpxml {vm_name}")
     disks = parse_disk_paths(r.stdout, f"test-infra-cluster-{source_id}")
     disk_sizes = parse_snapshot_disk_sizes(getattr(args, "disk_sizes", []), disks)
+    for disk in disks:
+        if disk["target"] in disk_sizes:
+            current = json.loads(env.run(
+                f"qemu-img info -U --output=json {shlex.quote(disk['path'])}").stdout)["virtual-size"]
+            requested = disk_sizes[disk["target"]]
+            if requested < current:
+                sys.exit(f"Refusing to shrink {disk['target']} from {current} to {requested} bytes")
     if disks and disks[0]["target"] in disk_sizes:
         # Fail before shutting down the source if offline root growth is unavailable.
         env.run("for tool in modprobe qemu-nbd flock lsblk blkid sgdisk parted partprobe mount umount xfs_growfs mktemp; do command -v \"$tool\" >/dev/null || exit 1; done")
@@ -6917,9 +6926,11 @@ def cmd_snapshot(args):
     print_step(9, 11, "Creating directories", "done")
 
     print_step(10, 11, f"Copying {len(disks)} disk(s)")
+    copied_disks = []
     try:
         for i, disk in enumerate(disks):
             dest = f"{fdir}/disk-{i}.qcow2"
+            copied_disks.append(dest)
             env.run(f"qemu-img convert -O qcow2 {shlex.quote(disk['path'])} {shlex.quote(dest)}")
             if disk["target"] in disk_sizes:
                 current = json.loads(env.run(
@@ -6933,6 +6944,15 @@ def cmd_snapshot(args):
                         grow_rhcos_root_disk(dest)
             env.run(f"chown qemu:qemu {shlex.quote(dest)}")
         print_step(10, 11, f"Copying {len(disks)} disk(s)", "done")
+    except BaseException:
+        for dest in copied_disks:
+            # A failed unmount leaves qemu-nbd holding the image open for recovery.
+            if env.run(f"fuser -s -- {shlex.quote(dest)}", check=False).returncode == 1:
+                removed = env.run(f"rm -f -- {shlex.quote(dest)}", check=False)
+                if removed.returncode == 0:
+                    continue
+            print(f"Preserving failed disk copy {dest} for recovery", file=sys.stderr)
+        raise
     finally:
         print_step(11, 11, "Restarting source VM")
         env.run(f"virsh start {vm_name}")

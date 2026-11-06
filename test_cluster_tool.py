@@ -3888,9 +3888,19 @@ class TestSnapshot(unittest.TestCase):
              patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
             with self.assertRaisesRegex(SystemExit, "shrink"):
                 ct.cmd_snapshot(self._snapshot_args(["sda=40G"]))
-        self.assertTrue(any("virsh start" in c for c in self.calls))
-        self.assertFalse(any("qemu-img resize" in c for c in self.calls))
+        self.assertTrue(any("qemu-img info -U --output=json /data/disk-0.qcow2" in c
+                            for c in self.calls))
+        self.assertFalse(any("virsh shutdown" in c or "qemu-img convert" in c
+                             for c in self.calls))
         self.assertNotIn("test-snap", self.mock_env.get_saved_state()["flavors"])
+
+    def test_snapshot_rejects_unsafe_flavor_name_before_running_commands(self):
+        for name in ("../outside", "snap;touch /tmp/injected", "snap with spaces"):
+            with self.subTest(name=name), patch.object(ct.env, "run") as run:
+                run.side_effect = SystemExit("unvalidated name reached command runner")
+                with self.assertRaisesRegex(SystemExit, "Invalid flavor name"):
+                    ct.cmd_snapshot(argparse.Namespace(name=name, source="aabb1122", disk_sizes=[]))
+                run.assert_not_called()
 
     @patch("time.sleep")
     def test_snapshot_grows_copied_os_root_offline(self, _):
@@ -3926,14 +3936,63 @@ class TestSnapshot(unittest.TestCase):
         def fail_growth(*args, **kwargs):
             if "qemu-nbd --connect" in args[0]:
                 raise SystemExit("offline growth failed")
+            if "fuser -s" in args[0]:
+                self.calls.append(args[0])
+                return MagicMock(returncode=1)
             return self.mock_env.wrap_run_positional(ssh)(*args, **kwargs)
         with patch.object(ct.env, "run", side_effect=fail_growth), \
              patch.object(ct.env, "run_vm", side_effect=ssh), \
              patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
             with self.assertRaisesRegex(SystemExit, "offline growth failed"):
                 ct.cmd_snapshot(self._snapshot_args(["sda=200G"]))
+        self.assertTrue(any("rm -f -- /data/cluster-tool/flavors/test-snap/disk-0.qcow2" in c
+                            for c in self.calls))
         self.assertTrue(any("virsh start" in c for c in self.calls))
         self.assertNotIn("test-snap", self.mock_env.get_saved_state()["flavors"])
+
+    @patch("time.sleep")
+    def test_snapshot_preserves_busy_copy_after_growth_failure(self, _):
+        ssh = self._make_ssh_mock()
+        def fail_growth(*args, **kwargs):
+            if "qemu-nbd --connect" in args[0]:
+                raise SystemExit("Could not unmount; leaving NBD connected")
+            return self.mock_env.wrap_run_positional(ssh)(*args, **kwargs)
+        with patch.object(ct.env, "run", side_effect=fail_growth), \
+             patch.object(ct.env, "run_vm", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            with self.assertRaisesRegex(SystemExit, "Could not unmount"):
+                ct.cmd_snapshot(self._snapshot_args(["sda=200G"]))
+        self.assertFalse(any("rm -f --" in c for c in self.calls))
+        self.assertTrue(any("virsh start" in c for c in self.calls))
+
+    @patch("time.sleep")
+    def test_snapshot_failed_conversion_removes_partial_copy(self, _):
+        self._DUMPXML = (
+            "<domain><devices>"
+            "<disk type='file' device='disk'><source file='/data/os.qcow2'/>"
+            "<target dev='sda' bus='scsi'/></disk>"
+            "<disk type='file' device='disk'><source file='/data/data.qcow2'/>"
+            "<target dev='sdb' bus='scsi'/></disk>"
+            "</devices></domain>"
+        )
+        ssh = self._make_ssh_mock()
+        def fail_conversion(*args, **kwargs):
+            if "qemu-img convert" in args[0] and "disk-1.qcow2" in args[0]:
+                self.calls.append(args[0])
+                raise SystemExit("conversion failed")
+            if "fuser -s" in args[0]:
+                self.calls.append(args[0])
+                return MagicMock(returncode=1)
+            return self.mock_env.wrap_run_positional(ssh)(*args, **kwargs)
+        with patch.object(ct.env, "run", side_effect=fail_conversion), \
+             patch.object(ct.env, "run_vm", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            with self.assertRaisesRegex(SystemExit, "conversion failed"):
+                ct.cmd_snapshot(self._snapshot_args())
+        for i in range(2):
+            self.assertTrue(any(f"rm -f -- /data/cluster-tool/flavors/test-snap/disk-{i}.qcow2" in c
+                                for c in self.calls))
+        self.assertTrue(any("virsh start" in c for c in self.calls))
 
     def test_offline_root_growth_script_checks_layout_and_parses(self):
         with patch.object(ct.env, "run") as run:
