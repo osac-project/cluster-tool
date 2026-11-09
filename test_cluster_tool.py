@@ -44,6 +44,7 @@ def _fixture_pem(kind, body):
 
 
 def _command_text(command):
+    """Render a command given as a string or argv list for call assertions."""
     return shlex.join(command) if isinstance(command, (list, tuple)) else command
 
 
@@ -1556,6 +1557,8 @@ class TestTransactionalBoot(unittest.TestCase):
 
 
 class TestDetectSourceVM(unittest.TestCase):
+    """Tests for parsing libvirt source VM XML."""
+
     def setUp(self):
         ct.env = ct.ExecutionEnv(host="test@host", host_ip="10.0.0.1")
 
@@ -1574,6 +1577,7 @@ Used memory:    67108864 KiB"""
 
     @patch.object(ct.ExecutionEnv, "run")
     def test_parse_disk_paths(self, mock_ssh):
+        """Disks resolve their paths, skip cdroms, and keep declared formats."""
         mock_ssh.return_value = MagicMock(stdout="/resolved/pool/disk-0\n")
         dumpxml = """<domain type='kvm'>
           <devices>
@@ -1604,6 +1608,7 @@ Used memory:    67108864 KiB"""
         self.assertEqual(disks[1]["format"], "raw")
 
     def test_parse_disk_paths_without_driver_format(self):
+        """A missing driver element yields a None format."""
         xml = ("<domain><devices><disk type='file' device='disk'>"
                "<source file='/data/os.qcow2'/><target dev='sda'/>"
                "</disk></devices></domain>")
@@ -3761,8 +3766,11 @@ class TestFlavorState(unittest.TestCase):
 
 
 class TestExecutionEnvArgv(unittest.TestCase):
+    """Tests for ExecutionEnv.run argument-list handling."""
+
     @patch("subprocess.run")
     def test_local_argv_does_not_use_shell(self, run):
+        """Local argv commands run without a shell."""
         run.return_value.returncode = 0
         argv = ["qemu-img", "info", "/data/image; echo not-a-command"]
         ct.ExecutionEnv(host="local", host_ip="127.0.0.1").run(argv)
@@ -3770,6 +3778,7 @@ class TestExecutionEnvArgv(unittest.TestCase):
 
     @patch("subprocess.run")
     def test_remote_argv_is_quoted_as_one_ssh_command(self, run):
+        """Remote argv commands are shell-joined into a single SSH command."""
         run.return_value.returncode = 0
         argv = ["qemu-img", "info", "/data/image; echo not-a-command"]
         ct.ExecutionEnv(host="test@host", host_ip="10.0.0.1").run(argv)
@@ -3780,12 +3789,15 @@ class TestExecutionEnvArgv(unittest.TestCase):
 
 
 class TestSnapshot(unittest.TestCase):
+    """Tests for the snapshot command and offline root growth."""
+
     def setUp(self):
         self.mock_env = MockStateEnv()
         self.mock_env.setup({"flavors": {}, "clones": {}})
         self.calls = []
 
     def _snapshot_args(self, disk_sizes=None):
+        """Build a snapshot argparse namespace with optional disk sizes."""
         return argparse.Namespace(name="test-snap", source="aabb1122", disk_sizes=disk_sizes or [])
 
     _DOMINFO = (
@@ -3805,8 +3817,10 @@ class TestSnapshot(unittest.TestCase):
     )
 
     def _make_ssh_mock(self):
+        """Build an env.run mock that records calls and answers known commands."""
         shutdown_called = {"v": False}
         def ssh(*args, check=True, **kwargs):
+            """Answer known commands and record every invoked command text."""
             cmd = _command_text(args[-1])
             self.calls.append(cmd)
             r = MagicMock()
@@ -3861,6 +3875,7 @@ class TestSnapshot(unittest.TestCase):
         self.assertEqual(len(cp_cmds), 0)
 
     def test_snapshot_disk_size_cli_option(self):
+        """The snapshot command exposes the repeatable --disk-size option."""
         result = subprocess.run(
             [sys.executable, "./cluster-tool", "snapshot", "--help"],
             capture_output=True, text=True, check=True,
@@ -3868,6 +3883,7 @@ class TestSnapshot(unittest.TestCase):
         self.assertIn("--disk-size", result.stdout)
 
     def test_snapshot_disk_size_validation(self):
+        """parse_snapshot_disk_sizes accepts valid sizes and rejects bad specs."""
         disks = [{"target": "vda", "path": "/images/os.qcow2"},
                  {"target": "vdb", "path": "/images/data.qcow2"}]
         self.assertEqual(
@@ -3881,6 +3897,7 @@ class TestSnapshot(unittest.TestCase):
 
     @patch("time.sleep")
     def test_snapshot_resizes_only_selected_copied_disks(self, _):
+        """Only disks with a requested size are resized, after their conversion."""
         self._DUMPXML = (
             "<domain><devices>"
             "<disk type='file' device='disk'><source file='/data/os.qcow2'/>"
@@ -3905,6 +3922,7 @@ class TestSnapshot(unittest.TestCase):
 
     @patch("time.sleep")
     def test_snapshot_disk_commands_use_argument_arrays(self, _):
+        """qemu-img commands are passed as argv lists, not shell strings."""
         ssh = self._make_ssh_mock()
         with patch.object(ct.env, "run", side_effect=self.mock_env.wrap_run_positional(ssh)) as run, \
              patch.object(ct.env, "run_vm", side_effect=ssh), \
@@ -3923,6 +3941,7 @@ class TestSnapshot(unittest.TestCase):
 
     @patch("time.sleep")
     def test_snapshot_preserves_source_formats_for_info_and_convert(self, _):
+        """Preflight info and convert use each disk's declared libvirt format."""
         self._DUMPXML = (
             "<domain><devices>"
             "<disk type='file' device='disk'><driver name='qemu' type='qcow2'/>"
@@ -3951,6 +3970,7 @@ class TestSnapshot(unittest.TestCase):
 
     @patch("time.sleep")
     def test_snapshot_equal_size_does_not_modify_disk(self, _):
+        """An equal requested size skips both resize and offline growth."""
         ssh = self._make_ssh_mock()
         with patch.object(ct.env, "run", side_effect=self.mock_env.wrap_run_positional(ssh)), \
              patch.object(ct.env, "run_vm", side_effect=ssh), \
@@ -3961,6 +3981,7 @@ class TestSnapshot(unittest.TestCase):
 
     @patch("time.sleep")
     def test_snapshot_rejects_shrinking_and_restarts_source(self, _):
+        """Shrink requests are refused by preflight before shutdown or conversion."""
         ssh = self._make_ssh_mock()
         with patch.object(ct.env, "run", side_effect=self.mock_env.wrap_run_positional(ssh)), \
              patch.object(ct.env, "run_vm", side_effect=ssh), \
@@ -3974,6 +3995,7 @@ class TestSnapshot(unittest.TestCase):
         self.assertNotIn("test-snap", self.mock_env.get_saved_state()["flavors"])
 
     def test_snapshot_rejects_unsafe_flavor_name_before_running_commands(self):
+        """Unsafe flavor names exit before any command runs."""
         for name in ("../outside", "snap;touch /tmp/injected", "snap with spaces"):
             with self.subTest(name=name), patch.object(ct.env, "run") as run:
                 run.side_effect = SystemExit("unvalidated name reached command runner")
@@ -3982,6 +4004,7 @@ class TestSnapshot(unittest.TestCase):
                 run.assert_not_called()
 
     def test_snapshot_rejects_unsafe_source_before_running_commands(self):
+        """Unsafe source IDs exit before any command runs."""
         for source in ("../outside", "dev;touch /tmp/injected", "dev with spaces"):
             with self.subTest(source=source), patch.object(ct.env, "run") as run:
                 run.side_effect = SystemExit("unvalidated source reached command runner")
@@ -3991,6 +4014,7 @@ class TestSnapshot(unittest.TestCase):
 
     @patch("time.sleep")
     def test_snapshot_grows_copied_os_root_offline(self, _):
+        """A grown first disk is partition-resized and XFS-grown via qemu-nbd."""
         ssh = self._make_ssh_mock()
         with patch.object(ct.env, "run", side_effect=self.mock_env.wrap_run_positional(ssh)), \
              patch.object(ct.env, "run_vm", side_effect=ssh), \
@@ -4010,6 +4034,7 @@ class TestSnapshot(unittest.TestCase):
 
     @patch("time.sleep")
     def test_snapshot_invalid_target_does_not_stop_source(self, _):
+        """Unknown --disk-size targets are refused before shutdown."""
         ssh = self._make_ssh_mock()
         with patch.object(ct.env, "run", side_effect=self.mock_env.wrap_run_positional(ssh)), \
              patch.object(ct.env, "run_vm", side_effect=ssh):
@@ -4019,8 +4044,10 @@ class TestSnapshot(unittest.TestCase):
 
     @patch("time.sleep")
     def test_snapshot_growth_failure_restarts_source_without_registering_flavor(self, _):
+        """Growth failures remove idle copies, restart the VM, and skip flavor state."""
         ssh = self._make_ssh_mock()
         def fail_growth(*args, **kwargs):
+            """Fail offline growth at NBD connect; report copies as unused."""
             cmd = _command_text(args[0])
             if "qemu-nbd --connect" in cmd:
                 raise SystemExit("offline growth failed")
@@ -4040,9 +4067,11 @@ class TestSnapshot(unittest.TestCase):
 
     @patch("time.sleep")
     def test_snapshot_preserves_busy_copy_after_growth_failure(self, _):
+        """Copies still held by a process are preserved with the fuser exit code."""
         import io
         ssh = self._make_ssh_mock()
         def fail_growth(*args, **kwargs):
+            """Fail offline growth at NBD connect, leaving the copy marked busy."""
             if "qemu-nbd --connect" in _command_text(args[0]):
                 raise SystemExit("Could not unmount; leaving NBD connected")
             return self.mock_env.wrap_run_positional(ssh)(*args, **kwargs)
@@ -4062,6 +4091,7 @@ class TestSnapshot(unittest.TestCase):
 
     @patch("time.sleep")
     def test_snapshot_failed_conversion_removes_partial_copy(self, _):
+        """Conversion failures remove all partial copies and restart the VM."""
         self._DUMPXML = (
             "<domain><devices>"
             "<disk type='file' device='disk'><source file='/data/os.qcow2'/>"
@@ -4072,6 +4102,7 @@ class TestSnapshot(unittest.TestCase):
         )
         ssh = self._make_ssh_mock()
         def fail_conversion(*args, **kwargs):
+            """Fail converting the second disk; report other copies as unused."""
             cmd = _command_text(args[0])
             if "qemu-img convert" in cmd and "disk-1.qcow2" in cmd:
                 self.calls.append(cmd)
@@ -4091,6 +4122,7 @@ class TestSnapshot(unittest.TestCase):
         self.assertTrue(any("virsh start" in c for c in self.calls))
 
     def test_offline_root_growth_script_checks_layout_and_parses(self):
+        """The growth script guards the RHCOS layout and passes the image as $1."""
         with patch.object(ct.env, "run") as run:
             ct.grow_rhcos_root_disk("/tmp/disk with spaces.qcow2")
         argv = run.call_args.args[0]
@@ -4107,6 +4139,7 @@ class TestSnapshot(unittest.TestCase):
         self.assertNotIn("/tmp/disk with spaces.qcow2", argv[2])
 
     def test_root_growth_disconnects_only_after_successful_connect(self):
+        """Cleanup disconnects the NBD device only when connect succeeded."""
         with patch.object(ct.env, "run") as run:
             ct.grow_rhcos_root_disk("/tmp/disk.qcow2")
         script = run.call_args.args[0][2]
@@ -4133,6 +4166,7 @@ class TestSnapshot(unittest.TestCase):
                                      ["--connect=/dev/nbd-test"] + ([] if fails else ["--disconnect"]))
 
     def test_offline_root_growth_skips_partition_nodes_when_nbd_is_busy(self):
+        """Device selection skips partition nodes and devices already in use."""
         with patch.object(ct.env, "run") as run:
             ct.grow_rhcos_root_disk("/tmp/disk.qcow2")
         script = run.call_args.args[0][2]

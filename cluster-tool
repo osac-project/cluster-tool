@@ -149,12 +149,15 @@ def _remote_shell_path(path):
 
 
 class ExecutionEnv:
+    """Runs commands on the hypervisor, either locally or over SSH."""
+
     def __init__(self, *, host, host_ip):
         self.host = host
         self.host_ip = host_ip
         self.is_local = (host == "local")
 
     def run(self, cmd, *, check=True):
+        """Run a command; argv lists skip the local shell and are joined for SSH."""
         shell_cmd = shlex.join(cmd) if isinstance(cmd, (list, tuple)) else cmd
         if self.is_local:
             r = subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True, text=True)
@@ -356,6 +359,7 @@ def parse_dominfo(dominfo_output):
 
 
 def parse_disk_paths(dumpxml_output, pool_name):
+    """Extract each disk's target, source path, and declared format from domain XML."""
     root = ET.fromstring(dumpxml_output)
     disks = []
     for disk in root.findall(".//disk"):
@@ -6778,6 +6782,7 @@ def cache_image(vm_ip, image, anchor_name):
 
 
 def cmd_snapshot(args):
+    """Create a flavor from a running cluster's disks, optionally growing copies."""
     flavor_name = args.name
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", flavor_name or ""):
         sys.exit("Invalid flavor name: use letters, digits, dots, underscores, or dashes")
@@ -7914,6 +7919,7 @@ def cmd_use(args):
 
 
 def main():
+    """Parse CLI arguments and dispatch the requested command."""
     global env
 
     parser = argparse.ArgumentParser(description="Snapshot-based SNO cluster cloning")
