@@ -6955,11 +6955,13 @@ def cmd_snapshot(args):
     except BaseException:
         for dest in copied_disks:
             # A failed unmount leaves qemu-nbd holding the image open for recovery.
-            if env.run(["fuser", "-s", "--", dest], check=False).returncode == 1:
+            fuser = env.run(["fuser", "-s", "--", dest], check=False)
+            if fuser.returncode == 1:
                 removed = env.run(["rm", "-f", "--", dest], check=False)
                 if removed.returncode == 0:
                     continue
-            print(f"Preserving failed disk copy {dest} for recovery", file=sys.stderr)
+            print(f"Preserving failed disk copy {dest} for recovery "
+                  f"(fuser exit {fuser.returncode})", file=sys.stderr)
         raise
     finally:
         print_step(11, 11, "Restarting source VM")

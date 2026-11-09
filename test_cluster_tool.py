@@ -4040,6 +4040,7 @@ class TestSnapshot(unittest.TestCase):
 
     @patch("time.sleep")
     def test_snapshot_preserves_busy_copy_after_growth_failure(self, _):
+        import io
         ssh = self._make_ssh_mock()
         def fail_growth(*args, **kwargs):
             if "qemu-nbd --connect" in _command_text(args[0]):
@@ -4047,11 +4048,17 @@ class TestSnapshot(unittest.TestCase):
             return self.mock_env.wrap_run_positional(ssh)(*args, **kwargs)
         with patch.object(ct.env, "run", side_effect=fail_growth), \
              patch.object(ct.env, "run_vm", side_effect=ssh), \
-             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file), \
+             patch("sys.stderr", new_callable=io.StringIO) as mock_err:
             with self.assertRaisesRegex(SystemExit, "Could not unmount"):
                 ct.cmd_snapshot(self._snapshot_args(["sda=200G"]))
         self.assertFalse(any("rm -f --" in c for c in self.calls))
         self.assertTrue(any("virsh start" in c for c in self.calls))
+        self.assertIn(
+            "Preserving failed disk copy /data/cluster-tool/flavors/test-snap/disk-0.qcow2 "
+            "for recovery (fuser exit 0)",
+            mock_err.getvalue(),
+        )
 
     @patch("time.sleep")
     def test_snapshot_failed_conversion_removes_partial_copy(self, _):
