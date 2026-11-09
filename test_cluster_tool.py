@@ -4121,6 +4121,55 @@ class TestSnapshot(unittest.TestCase):
                                 for c in self.calls))
         self.assertTrue(any("virsh start" in c for c in self.calls))
 
+    @patch("time.sleep")
+    def test_snapshot_existing_destination_refused_before_shutdown(self, _):
+        """A retry over copies left by a failed attempt is refused pre-shutdown."""
+        ssh = self._make_ssh_mock()
+        def existing_dest(*args, **kwargs):
+            """Report flavor destinations as existing files on the host."""
+            cmd = _command_text(args[-1])
+            if "test -e" in cmd:
+                r = MagicMock()
+                r.returncode = 0
+                r.stderr = ""
+                r.stdout = "yes"
+                return r
+            return ssh(*args, **kwargs)
+        with patch.object(ct.env, "run", side_effect=self.mock_env.wrap_run_positional(existing_dest)), \
+             patch.object(ct.env, "run_vm", side_effect=ssh):
+            with self.assertRaisesRegex(SystemExit, "Refusing to overwrite"):
+                ct.cmd_snapshot(self._snapshot_args())
+        self.assertFalse(any("virsh shutdown" in c for c in self.calls))
+        self.assertFalse(any("qemu-img convert" in c for c in self.calls))
+
+    @patch("time.sleep")
+    def test_snapshot_existing_destination_never_cleaned_up(self, _):
+        """A destination that appears after preflight is refused, not removed."""
+        ssh = self._make_ssh_mock()
+        after_shutdown = {"v": False}
+        def late_existing_dest(*args, **kwargs):
+            """Report destinations as existing only once the source is down."""
+            cmd = _command_text(args[-1])
+            if "virsh shutdown" in cmd:
+                after_shutdown["v"] = True
+            if "test -e" in cmd and after_shutdown["v"]:
+                r = MagicMock()
+                r.returncode = 0
+                r.stderr = ""
+                r.stdout = "yes"
+                return r
+            return ssh(*args, **kwargs)
+        with patch.object(ct.env, "run", side_effect=self.mock_env.wrap_run_positional(late_existing_dest)), \
+             patch.object(ct.env, "run_vm", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            with self.assertRaisesRegex(SystemExit, "Refusing to overwrite"):
+                ct.cmd_snapshot(self._snapshot_args())
+        self.assertFalse(any("qemu-img convert" in c for c in self.calls))
+        self.assertFalse(any("fuser -s" in c for c in self.calls))
+        self.assertFalse(any("rm -f --" in c for c in self.calls))
+        self.assertTrue(any("virsh start" in c for c in self.calls))
+        self.assertNotIn("test-snap", self.mock_env.get_saved_state()["flavors"])
+
     def test_offline_root_growth_script_checks_layout_and_parses(self):
         """The growth script guards the RHCOS layout and passes the image as $1."""
         with patch.object(ct.env, "run") as run:

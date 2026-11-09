@@ -461,6 +461,21 @@ xfs_growfs "$mount_dir"
     env.run(["bash", "-c", script, "--", image])
 
 
+def refuse_existing_snapshot_dest(dest):
+    """Exit when a snapshot disk-copy destination already exists.
+
+    A failed snapshot can leave copies behind without registering the
+    flavor, and 'flavors --delete' only removes registered flavors. A retry
+    would otherwise overwrite such a copy during qemu-img conversion, or
+    delete it through the failed-attempt cleanup. Callers invoke this before
+    qemu-img runs and before tracking the destination for cleanup, so only
+    copies the current attempt creates are ever overwritten or removed.
+    """
+    exists = env.run(f"test -e {shlex.quote(dest)} && echo yes || true")
+    if "yes" in exists.stdout:
+        sys.exit(f"Refusing to overwrite existing {dest}; move or remove it before retrying")
+
+
 def parse_subnet(net_xml):
     root = ET.fromstring(net_xml)
     ip_elem = root.find(".//ip[@family='ipv4']")
@@ -6804,6 +6819,10 @@ def cmd_snapshot(args):
     r = env.run(f"virsh dumpxml {vm_name}")
     disks = parse_disk_paths(r.stdout, f"test-infra-cluster-{source_id}")
     disk_sizes = parse_snapshot_disk_sizes(getattr(args, "disk_sizes", []), disks)
+    for i in range(len(disks)):
+        # Fail before shutting down the source if a previous attempt left
+        # copies behind; the copy step refuses to overwrite them.
+        refuse_existing_snapshot_dest(f"{fdir}/disk-{i}.qcow2")
     for disk in disks:
         if disk["target"] in disk_sizes:
             source_format = ["-f", disk["format"]] if disk["format"] else []
@@ -6942,6 +6961,9 @@ def cmd_snapshot(args):
     try:
         for i, disk in enumerate(disks):
             dest = f"{fdir}/disk-{i}.qcow2"
+            # Track the destination only after confirming this attempt will
+            # create it, so cleanup never removes a file we did not copy.
+            refuse_existing_snapshot_dest(dest)
             copied_disks.append(dest)
             source_format = ["-f", disk["format"]] if disk["format"] else []
             env.run(["qemu-img", "convert", *source_format, "-O", "qcow2", disk["path"], dest])
