@@ -5285,5 +5285,98 @@ class TestPullSecretInjection(unittest.TestCase):
         ct.KUBECONFIG_DIR.joinpath("aabbccdd.kubeconfig").unlink(missing_ok=True)
 
 
+class TestCompactGuestOc(unittest.TestCase):
+    def test_boot_transport_uses_guest_and_clone_keeps_host_oc(self):
+        nodes = [{"role": role, "ip": ip} for role, ip in zip(
+            ct.COMPACT_ROLES, ("192.168.230.69", "192.168.230.81", "192.168.230.89"))]
+        ctx = ct.CompactCloneContext(
+            source={}, clone_id="edge30", nodes=nodes, identity="/tmp/id key",
+            work="/tmp/clone work", crypto="/tmp/crypto", etcd_image="etcd",
+            ingress_cn="cn", plan_path="/plan", src_kc="/source", pairs=[],
+            guest_oc=True,
+        )
+        command = ct.compact_guest_oc(ctx, "https://192.168.230.69:6443")
+        self.assertIn("guest-oc.py", command)
+        self.assertIn("192.168.230.81", command)
+        self.assertIn("--server=https://192.168.230.69:6443", command)
+        compile(ct.compact_guest_oc_script(), "guest-oc.py", "exec")
+        self.assertFalse(ct.CompactCloneContext(
+            source={}, clone_id="edge30", nodes=nodes, identity="/id",
+            work="/work", crypto="/crypto", etcd_image="etcd",
+            ingress_cn="cn", plan_path="/plan", src_kc="/source", pairs=[],
+        ).guest_oc)
+
+    def test_guest_transport_stages_files_and_returns_extracted_data(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            scripts = {
+                "ssh": """#!/bin/bash
+while [[ "$1" == -o || "$1" == -i || "$1" == -L ]]; do shift 2; done
+shift
+printf '%s\n' "$1" >> "$SSH_LOG"
+exec bash -c "$1"
+""",
+                "sudo": "#!/bin/bash\nexec \"$@\"\n",
+                "oc": """#!/bin/bash
+for arg in "$@"; do
+  case "$arg" in
+    --patch-file=*) patch="${arg#*=}" ;;
+    --from-file=*) from_file="${arg##*=}" ;;
+    --to=*) out="${arg#*=}" ;;
+    --kubeconfig=*) config="${arg#*=}" ;;
+  esac
+  if [[ "$previous" == --patch-file ]]; then patch="$arg"; fi
+  previous="$arg"
+done
+if [[ " $* " == *" set-cluster "* ]]; then printf updated > "$config"; fi
+if [[ -n "$patch" ]]; then cat "$patch"; fi
+if [[ -n "$from_file" ]]; then cat "$from_file"; fi
+if [[ -n "$out" && "$out" != - ]]; then printf extracted > "$out/tls.key"; fi
+""",
+            }
+            for name, source in scripts.items():
+                path = bin_dir / name
+                path.write_text(source)
+                path.chmod(0o755)
+            runner = root / "guest-oc.py"
+            runner.write_text(ct.compact_guest_oc_script())
+            ssh_log = root / "ssh.log"
+            environment = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}",
+                               SSH_LOG=str(ssh_log))
+            def run(*args):
+                return subprocess.run(
+                    [sys.executable, str(runner), "--vm", "192.168.230.81",
+                     "--identity", str(root / "key"), "--", *args],
+                    env=environment, capture_output=True, text=True)
+            simple = run("whoami")
+            self.assertEqual(simple.returncode, 0, simple.stderr)
+            self.assertEqual(len(ssh_log.read_text().splitlines()), 1)
+            self.assertIn("sudo oc", ssh_log.read_text())
+            patch_file = root / "patch file.json"
+            patch_file.write_text('{"test": true}')
+            patched = run("patch", "cm", "example", "--patch-file", str(patch_file))
+            self.assertEqual(patched.returncode, 0, patched.stderr)
+            self.assertEqual(patched.stdout, patch_file.read_text())
+            secret = root / "pull secret.json"
+            secret.write_text('{"auths": {}}')
+            injected = run("set", "data", "secret/pull-secret",
+                           f"--from-file=.dockerconfigjson={secret}")
+            self.assertEqual(injected.returncode, 0, injected.stderr)
+            self.assertEqual(injected.stdout, secret.read_text())
+            out = root / "extracted"
+            extracted = run("extract", "secret/router-ca", f"--to={out}")
+            self.assertEqual(extracted.returncode, 0, extracted.stderr)
+            self.assertEqual((out / "tls.key").read_text(), "extracted")
+            self.assertEqual((out / "tls.key").stat().st_mode & 0o777, 0o600)
+            config = root / "clone.kubeconfig"
+            config.write_text("original")
+            configured = run("config", "set-cluster", "cluster", f"--kubeconfig={config}")
+            self.assertEqual(configured.returncode, 0, configured.stderr)
+            self.assertEqual(config.read_text(), "updated")
+            self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+
+
 if __name__ == "__main__":
     unittest.main()
