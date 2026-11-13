@@ -5286,6 +5286,10 @@ class TestPullSecretInjection(unittest.TestCase):
 
 
 class TestCompactGuestOc(unittest.TestCase):
+    def test_live_clone_keeps_host_oc_by_default(self):
+        guest_oc = inspect.signature(ct._start_compact_clone).parameters["guest_oc"]
+        self.assertFalse(guest_oc.default)
+
     def test_boot_transport_uses_guest_and_clone_keeps_host_oc(self):
         nodes = [{"role": role, "ip": ip} for role, ip in zip(
             ct.COMPACT_ROLES, ("192.168.230.69", "192.168.230.81", "192.168.230.89"))]
