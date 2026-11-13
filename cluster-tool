@@ -5589,6 +5589,7 @@ def _finish_compact_clone(ctx, start_at=None):
 def _start_compact_clone(
     source, clone_id, subnet, nodes, macs, identity, work, crypto, etcd_image,
     ingress_cn, memory_kib, vcpus, skip_hash_check=False, pull_secret=None,
+    guest_oc=False,
 ):
     """Define the compact guests, restore etcd, and start the heal."""
     plan_path = "/out/summary.txt"
@@ -5701,7 +5702,7 @@ def _start_compact_clone(
         source=source, clone_id=clone_id, nodes=nodes, identity=identity,
         work=work, crypto=crypto, etcd_image=etcd_image, ingress_cn=ingress_cn,
         plan_path=plan_path, src_kc=src_kc, pairs=pairs, pull_secret=pull_secret,
-        guest_oc=True,
+        guest_oc=guest_oc,
     )
     return _finish_compact_clone(context)
 
@@ -5951,7 +5952,7 @@ def run_compact_from_flavor(
     health = _start_compact_clone(
         source, clone_id, subnet, nodes, macs, identity, work, crypto,
         flavor["etcd_image"], ingress_cn, memory_kib, vcpus,
-        skip_hash_check=True, pull_secret=pull_secret)
+        skip_hash_check=True, pull_secret=pull_secret, guest_oc=True)
     mark_compact_clone_running(clone_id)
     return health
 
