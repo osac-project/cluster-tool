@@ -3160,11 +3160,203 @@ def _oc(kubeconfig, server):
     )
 
 
-def compact_configure_runner_kubeconfig(kubeconfig, api_vip, api_server_name):
+COMPACT_GUEST_KUBECONFIG = (
+    "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/"
+    "secrets/node-kubeconfigs/lb-ext.kubeconfig"
+)
+
+
+def compact_guest_oc_script():
+    """Host-side transport for running oc in a compact master VM.
+
+    The normal API operations use the VM's kubeconfig. File arguments are
+    copied into a private guest directory for that invocation, then removed.
+    """
+    return textwrap.dedent('''\
+        #!/usr/bin/env python3
+        import argparse
+        import io
+        import os
+        from pathlib import Path
+        import shlex
+        import signal
+        import socket
+        import subprocess
+        import sys
+        import tarfile
+        import tempfile
+
+        SSH = ["ssh", *__SSH_OPTS__]
+        GUEST_KUBECONFIG = __GUEST_KUBECONFIG__
+
+        def main():
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--vm", required=True)
+            parser.add_argument("--identity", required=True)
+            args, oc_args = parser.parse_known_args()
+            if oc_args and oc_args[0] == "--":
+                oc_args.pop(0)
+            ssh = [*SSH, "-i", args.identity, f"core@{args.vm}"]
+
+            def run(command, *, data=None):
+                return subprocess.run([*ssh, command], input=data, capture_output=True)
+
+            # `oc proxy` must expose its listener to the host-side conditional
+            # delete script. Forward a local port to the guest's loopback port.
+            if "proxy" in oc_args:
+                with socket.socket() as listener:
+                    listener.bind(("127.0.0.1", 0))
+                    port = listener.getsockname()[1]
+                remote = ["sudo", "oc", f"--kubeconfig={GUEST_KUBECONFIG}",
+                          *[arg for arg in oc_args if not arg.startswith("--port=")],
+                          f"--port={port}"]
+                print(f"127.0.0.1:{port}", flush=True)
+                child = subprocess.Popen([*SSH, "-i", args.identity, "-o", "ExitOnForwardFailure=yes",
+                                          "-L", f"127.0.0.1:{port}:127.0.0.1:{port}",
+                                          f"core@{args.vm}", shlex.join(remote)])
+                def stop(_signum, _frame):
+                    child.terminate()
+                    try:
+                        child.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        child.kill()
+                    sys.exit(0)
+                signal.signal(signal.SIGTERM, stop)
+                signal.signal(signal.SIGINT, stop)
+                return child.wait()
+
+            needs_files = any(
+                arg in ("-f", "--patch-file") or arg.startswith(("--from-file=", "--kubeconfig="))
+                or (arg.startswith("--to=") and arg != "--to=-")
+                for arg in oc_args)
+            if not needs_files:
+                remote = ["sudo", "oc", f"--kubeconfig={GUEST_KUBECONFIG}", *oc_args]
+                result = run(shlex.join(remote))
+                sys.stdout.buffer.write(result.stdout)
+                sys.stderr.buffer.write(result.stderr)
+                return result.returncode
+
+            work = run("mktemp -d /tmp/cluster-tool-oc.XXXXXXXX")
+            if work.returncode != 0:
+                sys.stderr.buffer.write(work.stderr)
+                return work.returncode
+            guest_dir = work.stdout.decode().strip()
+            if not guest_dir.startswith("/tmp/cluster-tool-oc."):
+                print("Unexpected guest temporary path", file=sys.stderr)
+                return 1
+            signal.signal(signal.SIGTERM, lambda _signum, _frame: sys.exit(143))
+            signal.signal(signal.SIGINT, lambda _signum, _frame: sys.exit(130))
+            output_dir = None
+            host_config = None
+            guest_config = None
+            try:
+                mapped = []
+                index = 0
+                while index < len(oc_args):
+                    arg = oc_args[index]
+                    path = None
+                    prefix = None
+                    if arg in ("-f", "--patch-file") and index + 1 < len(oc_args):
+                        mapped.append(arg)
+                        index += 1
+                        path = oc_args[index]
+                    elif arg.startswith("--from-file="):
+                        prefix, _, path = arg.rpartition("=")
+                    elif arg.startswith("--kubeconfig="):
+                        prefix = "--kubeconfig"
+                        path = arg.split("=", 1)[1]
+                        host_config = path
+                    elif arg.startswith("--to=") and arg != "--to=-":
+                        output_dir = Path(arg.split("=", 1)[1])
+                        mapped.append(f"--to={guest_dir}/extracted")
+                        index += 1
+                        continue
+                    if path is not None:
+                        source = Path(path)
+                        if not source.is_file():
+                            print(f"Missing oc input file: {path}", file=sys.stderr)
+                            return 1
+                        guest_path = f"{guest_dir}/input-{index}"
+                        copied = run(f"umask 077; cat > {shlex.quote(guest_path)}", data=source.read_bytes())
+                        if copied.returncode != 0:
+                            sys.stderr.buffer.write(copied.stderr)
+                            return copied.returncode
+                        mapped.append(f"{prefix}={guest_path}" if prefix else guest_path)
+                        if prefix == "--kubeconfig":
+                            guest_config = guest_path
+                    else:
+                        mapped.append(arg)
+                    index += 1
+                if output_dir:
+                    made = run(f"mkdir -m 700 {shlex.quote(guest_dir + '/extracted')}")
+                    if made.returncode != 0:
+                        sys.stderr.buffer.write(made.stderr)
+                        return made.returncode
+                remote = ["sudo", "oc"]
+                if host_config is None:
+                    remote.append(f"--kubeconfig={GUEST_KUBECONFIG}")
+                remote.extend(mapped)
+                result = run(shlex.join(remote))
+                sys.stdout.buffer.write(result.stdout)
+                sys.stderr.buffer.write(result.stderr)
+                if result.returncode != 0:
+                    return result.returncode
+                if output_dir:
+                    archived = run(f"sudo tar -C {shlex.quote(guest_dir + '/extracted')} -cf - .")
+                    if archived.returncode != 0:
+                        sys.stderr.buffer.write(archived.stderr)
+                        return archived.returncode
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    with tarfile.open(fileobj=io.BytesIO(archived.stdout), mode="r:") as archive:
+                        for entry in archive:
+                            name = Path(entry.name)
+                            if not entry.isfile() or name.is_absolute() or ".." in name.parts:
+                                continue
+                            target = output_dir / name
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            with archive.extractfile(entry) as source, open(target, "wb") as dest:
+                                dest.write(source.read())
+                            os.chmod(target, 0o600)
+                if host_config is not None and "set-cluster" in oc_args:
+                    updated = run(f"sudo cat {shlex.quote(guest_config)}")
+                    if updated.returncode != 0:
+                        sys.stderr.buffer.write(updated.stderr)
+                        return updated.returncode
+                    target = Path(host_config)
+                    fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+                    try:
+                        with os.fdopen(fd, "wb") as stream:
+                            stream.write(updated.stdout)
+                        os.replace(temporary, target)
+                    finally:
+                        if os.path.exists(temporary):
+                            os.unlink(temporary)
+                return 0
+            finally:
+                run(f"rm -rf -- {shlex.quote(guest_dir)}")
+
+        if __name__ == "__main__":
+            sys.exit(main())
+        ''').replace("__SSH_OPTS__", repr(SSH_OPTS)).replace(
+            "__GUEST_KUBECONFIG__", repr(COMPACT_GUEST_KUBECONFIG))
+
+
+def compact_guest_oc(ctx, server=None, timeout=40):
+    """Build a command that runs oc inside the quorum master VM."""
+    script = f"{ctx.work}/guest-oc.py"
+    command = (f"python3 {shlex.quote(script)} --vm {shlex.quote(ctx.api_ip)} "
+               f"--identity {shlex.quote(ctx.identity)} --")
+    if server:
+        command += (f" --insecure-skip-tls-verify --request-timeout={timeout}s "
+                    f"--server={shlex.quote(server)}")
+    return command
+
+
+def compact_configure_runner_kubeconfig(kubeconfig, api_vip, api_server_name, oc="oc"):
     """Point the saved kubeconfig at the clone API VIP and its certificate name."""
     quoted_path = shlex.quote(kubeconfig)
     cluster = env.run(
-        f"oc config view --kubeconfig={quoted_path} --minify "
+        f"{oc} config view --kubeconfig={quoted_path} --minify "
         "-o jsonpath='{.clusters[0].name}'",
         check=False,
     )
@@ -3175,7 +3367,7 @@ def compact_configure_runner_kubeconfig(kubeconfig, api_vip, api_server_name):
     server = f"https://{api_vip}:6443"
     env.run(f"chmod 600 {quoted_path}")
     updated = env.run(
-        f"umask 077 && oc config set-cluster {shlex.quote(cluster_name)} --kubeconfig={quoted_path} "
+        f"umask 077 && {oc} config set-cluster {shlex.quote(cluster_name)} --kubeconfig={quoted_path} "
         f"--server={shlex.quote(server)} --tls-server-name={shlex.quote(api_server_name)}",
         check=False,
     )
@@ -3206,18 +3398,20 @@ def _inject_compact_pull_secret(clone_oc, work, pull_secret):
     _clone_log(work, "injected the runner-provided pull secret")
 
 
-def _admin_auth_command(kubeconfig, ip):
+def _admin_auth_command(kubeconfig, ip, guest_oc=None):
     """Build an oc whoami command aimed at one API server."""
+    if guest_oc:
+        return f"{guest_oc('https://' + ip + ':6443')} whoami"
     return (
         f"KUBECONFIG={shlex.quote(kubeconfig)} oc --insecure-skip-tls-verify "
         f"--request-timeout=20s --server={shlex.quote('https://' + ip + ':6443')} whoami"
     )
 
 
-def compact_admin_auth_results(kubeconfig, nodes):
+def compact_admin_auth_results(kubeconfig, nodes, guest_oc=None):
     """Ask every master to accept the admin client certificate."""
     probes = _in_parallel_results(nodes, lambda node: env.run(
-        _admin_auth_command(kubeconfig, node["ip"]), check=False))
+        _admin_auth_command(kubeconfig, node["ip"], guest_oc), check=False))
     return [
         {
             "role": node["role"],
@@ -3254,11 +3448,11 @@ def compact_serviceaccount_auth_results(oc, nodes, work):
     return results
 
 
-def _wait_admin_auth(kubeconfig, node, attempts=36):
+def _wait_admin_auth(kubeconfig, node, attempts=36, guest_oc=None):
     """Wait until one API server accepts the admin client certificate."""
     last = ""
     for _ in range(attempts):
-        probe = env.run(_admin_auth_command(kubeconfig, node["ip"]), check=False)
+        probe = env.run(_admin_auth_command(kubeconfig, node["ip"], guest_oc), check=False)
         if probe.returncode == 0 and "system:" in (probe.stdout or ""):
             return
         last = ((probe.stderr or "") + "\n" + (probe.stdout or "")).strip()
@@ -3290,7 +3484,7 @@ def _extract_secret(oc, namespace, name, key, dest):
     env.run(f"chmod 600 {shlex.quote(dest)}")
 
 
-def _sync_requestheader_aggregator_ca(kubeconfig, api_ip, work, identity, quorum_ip):
+def _sync_requestheader_aggregator_ca(kubeconfig, api_ip, work, identity, quorum_ip, oc=None):
     """Trust only the quorum aggregator CA for aggregated API calls.
 
     Recert leaves a second aggregator CA with the same subject in
@@ -3312,7 +3506,7 @@ def _sync_requestheader_aggregator_ca(kubeconfig, api_ip, work, identity, quorum
     patch_path = f"{work}/requestheader-ca.patch.json"
     env.write_file(ca_path, pem)
     env.run(f"chmod 600 {shlex.quote(ca_path)}")
-    oc = _oc(kubeconfig, f"https://{api_ip}:6443")
+    oc = oc or _oc(kubeconfig, f"https://{api_ip}:6443")
     _clone_log(work, "set aggregated API trust to the quorum aggregator CA")
     for _ in range(6):
         current = env.run(
@@ -4347,6 +4541,7 @@ class CompactCloneContext:
     src_kc: str
     pairs: list
     pull_secret: str = None
+    guest_oc: bool = False
 
     @property
     def by_role(self):
@@ -4469,18 +4664,23 @@ def _run_compact_recert_phase(ctx):
             f"Log: {work}/clone.log")
     _clone_log(work, "start kubelet on master-0-0 so it loads the quorum client CA")
     _vm(recert_node["ip"], compact_start_recert_node_script(), identity, check=False)
-    _wait_admin_auth(src_kc, recert_node)
-    early_oc = _oc(src_kc, f"https://{api_ip}:6443")
+    _wait_admin_auth(
+        src_kc, recert_node,
+        guest_oc=(lambda server: compact_guest_oc(ctx, server, timeout=20)) if ctx.guest_oc else None)
+    early_oc = (compact_guest_oc(ctx, f"https://{api_ip}:6443") if ctx.guest_oc
+                else _oc(src_kc, f"https://{api_ip}:6443"))
     certs = _require_reissued_etcd_certs(early_oc, nodes, identity, work)
     if _revision_int(certs.get("etcd_revision_baseline")):
         etcd_revision_baseline = certs["etcd_revision_baseline"]
         _store_revision_baseline(work, "etcd", etcd_revision_baseline)
-    _sync_requestheader_aggregator_ca(src_kc, api_ip, work, identity, quorum["ip"])
+    _sync_requestheader_aggregator_ca(
+        src_kc, api_ip, work, identity, quorum["ip"], oc=early_oc)
 
     _clone_log(work, "sign kubelet certificates with the live CSR signer")
     clone_kc = f"{work}/clone.kubeconfig"
     env.run(f"cp {shlex.quote(src_kc)} {shlex.quote(clone_kc)}")
-    clone_oc = _oc(clone_kc, f"https://{api_ip}:6443")
+    clone_oc = (compact_guest_oc(ctx, f"https://{api_ip}:6443") if ctx.guest_oc
+                else _oc(clone_kc, f"https://{api_ip}:6443"))
     signer = f"{work}/csr-signer"
     env.run(f"mkdir -p {shlex.quote(signer)} && chmod 700 {shlex.quote(signer)}")
     _extract_secret(clone_oc, "openshift-kube-controller-manager-operator", "csr-signer", "tls.crt", f"{signer}/tls.crt")
@@ -5093,7 +5293,9 @@ def _wait_compact_install_ready(
             "etcd_membership": lambda: _vm(api_ip,
                 etcdctl + "member list " + etcdctl_auth,
                 identity, check=False),
-            "auth": lambda: compact_admin_auth_results(clone_kc, nodes),
+            "auth": lambda: compact_admin_auth_results(
+                clone_kc, nodes,
+                guest_oc=(lambda server: compact_guest_oc(ctx, server, timeout=20)) if ctx.guest_oc else None),
             "domains": lambda: compact_identity_domains(clone_oc),
             "api_url_files": lambda: _in_parallel_results(nodes, lambda node: _vm(
                 node["ip"], "sudo cat /etc/kubernetes/apiserver-url.env", identity, check=False)),
@@ -5245,6 +5447,9 @@ def _finish_compact_clone(ctx, start_at=None):
     api_vip = ctx.api_vip
     desired_master_render = ""
     expected_api_url = ""
+    if ctx.guest_oc:
+        env.write_file(f"{work}/guest-oc.py", compact_guest_oc_script(), private=True)
+        env.run(f"chmod 700 {shlex.quote(work + '/guest-oc.py')}")
     _clone_log(work, "remove stale source API-server leases from clone etcd")
     _clear_compact_stale_master_leases(nodes, identity, etcd_image, work)
     if start_at == "health":
@@ -5272,8 +5477,11 @@ def _finish_compact_clone(ctx, start_at=None):
     clone_kc = f"{work}/clone.kubeconfig"
     if "yes" not in env.run(f"test -f {shlex.quote(clone_kc)} && echo yes || true").stdout:
         env.run(f"cp {shlex.quote(src_kc)} {shlex.quote(clone_kc)}")
-    compact_configure_runner_kubeconfig(clone_kc, api_vip, f"api.{domain}")
-    clone_oc = _oc(clone_kc, f"https://{api_ip}:6443")
+    compact_configure_runner_kubeconfig(
+        clone_kc, api_vip, f"api.{domain}",
+        oc=compact_guest_oc(ctx) if ctx.guest_oc else "oc")
+    clone_oc = (compact_guest_oc(ctx, f"https://{api_ip}:6443") if ctx.guest_oc
+                else _oc(clone_kc, f"https://{api_ip}:6443"))
     _clear_expired_mco_controller_lease(clone_oc, work)
     _clone_log(
         work,
@@ -5493,6 +5701,7 @@ def _start_compact_clone(
         source=source, clone_id=clone_id, nodes=nodes, identity=identity,
         work=work, crypto=crypto, etcd_image=etcd_image, ingress_cn=ingress_cn,
         plan_path=plan_path, src_kc=src_kc, pairs=pairs, pull_secret=pull_secret,
+        guest_oc=True,
     )
     return _finish_compact_clone(context)
 
@@ -5701,6 +5910,7 @@ def run_compact_from_flavor(
             work=work, crypto=crypto, etcd_image=flavor["etcd_image"],
             ingress_cn=ingress_cn, plan_path="/out/summary.txt",
             src_kc=f"{work}/source.kubeconfig", pairs=pairs, pull_secret=pull_secret,
+            guest_oc=True,
         )
         health = _finish_compact_clone(
             context, start_at=None if resume == "recert" else resume)

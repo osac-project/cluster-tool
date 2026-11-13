@@ -276,6 +276,8 @@ IMAGE=quay.io/example/cluster-flavors:mno-3node
 
 `--pull-secret` is optional and takes a path to a valid OpenShift pull-secret JSON file. `--memory-kib` and `--vcpus` override the flavor's VM settings. The `--resume` options are for continuing an existing interrupted clone; they are `recert`, `heal`, and `health` for `compact-clone`, and `recert`, `rewrite`, and `health` for `compact-boot`. A successful compact boot waits for all nodes to be Ready, the master MachineConfigPool to be updated and healthy, newer etcd and kube-apiserver revisions on every master, and the required operators to remain quiet across two observations before returning.
 
+During `compact-boot`, `oc` runs inside the quorum master VM over SSH, using its local kubeconfig. The host still receives the clone kubeconfig for callers and CI, but does not need its own `oc` binary for the boot.
+
 ## OCI Distribution
 
 Flavors are distributed as OCI container images via any registry (Quay.io, Docker Hub, etc.).
