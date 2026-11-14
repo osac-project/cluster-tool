@@ -5286,6 +5286,21 @@ class TestPullSecretInjection(unittest.TestCase):
 
 
 class TestCompactGuestOc(unittest.TestCase):
+    def test_guest_ssh_operations_are_bounded(self):
+        script = ct.compact_guest_oc_script()
+        namespace = {"__name__": "guest_oc_test"}
+        exec(compile(script, "guest-oc.py", "exec"), namespace)
+        args = ["guest-oc.py", "--vm", "192.168.230.81", "--identity", "/id", "--", "whoami"]
+        with patch.object(sys, "argv", args):
+            with patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("ssh", 120)) as ssh_run:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    namespace["main"]()
+        command = ssh_run.call_args.args[0]
+        self.assertIn("ConnectTimeout=10", command)
+        self.assertIn("ServerAliveInterval=10", command)
+        self.assertIn("ServerAliveCountMax=3", command)
+        self.assertEqual(ssh_run.call_args.kwargs["timeout"], 120)
+
     def test_live_clone_keeps_host_oc_by_default(self):
         guest_oc = inspect.signature(ct._start_compact_clone).parameters["guest_oc"]
         self.assertFalse(guest_oc.default)
