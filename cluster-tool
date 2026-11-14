@@ -3186,7 +3186,8 @@ def compact_guest_oc_script():
         import tarfile
         import tempfile
 
-        SSH_COMMAND_TIMEOUT = 120
+# `oc wait` may run for 120s; allow another minute for SSH setup and output.
+        SSH_COMMAND_TIMEOUT = 180
         SSH = [
             "ssh",
             "-o", "ConnectTimeout=10",
