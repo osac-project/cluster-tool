@@ -3186,7 +3186,14 @@ def compact_guest_oc_script():
         import tarfile
         import tempfile
 
-        SSH = ["ssh", *__SSH_OPTS__]
+        SSH_COMMAND_TIMEOUT = 120
+        SSH = [
+            "ssh",
+            "-o", "ConnectTimeout=10",
+            "-o", "ServerAliveInterval=10",
+            "-o", "ServerAliveCountMax=3",
+            *__SSH_OPTS__,
+        ]
         GUEST_KUBECONFIG = __GUEST_KUBECONFIG__
 
         def main():
@@ -3199,7 +3206,10 @@ def compact_guest_oc_script():
             ssh = [*SSH, "-i", args.identity, f"core@{args.vm}"]
 
             def run(command, *, data=None):
-                return subprocess.run([*ssh, command], input=data, capture_output=True)
+                return subprocess.run(
+                    [*ssh, command], input=data, capture_output=True,
+                    timeout=SSH_COMMAND_TIMEOUT,
+                )
 
             # `oc proxy` must expose its listener to the host-side conditional
             # delete script. Forward a local port to the guest's loopback port.
