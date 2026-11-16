@@ -5526,6 +5526,59 @@ class TestRunVmQuoting(unittest.TestCase):
         self.assertNotIn("'~/", remote)
 
 
+class TestOwnershipRestoration(unittest.TestCase):
+    def test_local_write_restores_ownership_under_invoking_home(self):
+        local = ct.ExecutionEnv(host="local", host_ip="127.0.0.1")
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            home.mkdir()
+            target = home / "state.json"
+            with patch.object(ct, "_REAL_HOME", home), \
+                    patch.object(ct.os, "geteuid", return_value=0), \
+                    patch.dict(os.environ, {"SUDO_UID": "1234", "SUDO_GID": "5678"}), \
+                    patch.object(ct.os, "chown") as chown:
+                local.write_file(str(target), "{}")
+
+            self.assertEqual(
+                [call.args for call in chown.call_args_list],
+                [(str(target.parent), 1234, 5678), (str(target), 1234, 5678)],
+            )
+
+    def test_local_private_write_does_not_chown_compact_clone_directory(self):
+        local = ct.ExecutionEnv(host="local", host_ip="127.0.0.1")
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            home.mkdir()
+            target = Path(directory) / "clone" / "source.kubeconfig"
+            with patch.object(ct, "_REAL_HOME", home), \
+                    patch.object(ct.os, "geteuid", return_value=0), \
+                    patch.dict(os.environ, {"SUDO_UID": "1234", "SUDO_GID": "5678"}), \
+                    patch.object(ct.os, "chown") as chown:
+                local.write_file(str(target), "secret", private=True)
+
+            chown.assert_not_called()
+            self.assertEqual(target.read_text(), "secret")
+            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    def test_symlink_under_home_does_not_restore_external_ownership(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            external_dir = Path(directory) / "external"
+            home.mkdir()
+            external_dir.mkdir()
+            link = home / "external"
+            link.symlink_to(external_dir, target_is_directory=True)
+            target = external_dir / "source.kubeconfig"
+            target.write_text("secret")
+            with patch.object(ct, "_REAL_HOME", home), \
+                    patch.object(ct.os, "geteuid", return_value=0), \
+                    patch.dict(os.environ, {"SUDO_UID": "1234", "SUDO_GID": "5678"}), \
+                    patch.object(ct.os, "chown") as chown:
+                ct._restore_ownership(link / target.name)
+
+            chown.assert_not_called()
+
+
 class TestPrivateWrites(unittest.TestCase):
     def test_local_private_write_replaces_with_mode_0600_file(self):
         local = ct.ExecutionEnv(host="local", host_ip="127.0.0.1")

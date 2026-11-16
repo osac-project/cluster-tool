@@ -61,16 +61,11 @@ CLIENT_SERVERS_FILE = CLIENT_CONFIG_DIR / "servers.json"
 
 
 def _restore_ownership(path):
-    """When invoked via sudo (the normal CI path for boot/destroy/etc.,
-    which need root for libvirt/network operations), any file or
-    directory this process creates or writes is owned by root -- even
-    though _REAL_HOME above correctly points at the invoking user's
-    home. That leaves state.json/state.lock/haproxy.lock/kubeconfigs
-    root-owned after every run, silently breaking the next unprivileged
-    (non-sudo) read/write of the same paths. Chown back to the
-    SUDO_UID/SUDO_GID sudo records for the real invoking user whenever
-    we're running as root under sudo; a no-op otherwise (e.g. local,
-    non-CI use without sudo).
+    """Restore sudo-created files in the invoking user's home to that user.
+
+    State files, locks, and kubeconfigs under the user's home must remain
+    writable without sudo. Files elsewhere, including compact clone data
+    under /var/lib/libvirt/images, must retain their root ownership.
 
     Fails loudly (sys.exit), matching this codebase's convention, rather
     than warning and continuing -- a silently-swallowed chown failure
@@ -82,6 +77,8 @@ def _restore_ownership(path):
     sudo_uid = os.environ.get("SUDO_UID")
     sudo_gid = os.environ.get("SUDO_GID")
     if sudo_uid is None or sudo_gid is None:
+        return
+    if not Path(path).resolve().is_relative_to(_REAL_HOME.resolve()):
         return
     try:
         os.chown(str(path), int(sudo_uid), int(sudo_gid))
